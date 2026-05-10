@@ -1,0 +1,353 @@
+"""Kotak Neo broker client for NeoADX — wraps neo-api-client."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+import requests
+
+from config.settings import (
+    NEO_CONSUMER_KEY,
+    NEO_CONSUMER_SECRET,
+    NEO_ACCESS_TOKEN,
+    NEO_UCC,
+    NEO_ENVIRONMENT,
+    CANDLE_INTERVAL,
+    EXCHANGE,
+    INDEX_EXCHANGE,
+    LIVE_TRADE,
+    DRY_RUN_LOG,
+)
+
+logger = logging.getLogger(__name__)
+
+_CHART_BASE_URL = "https://gw-napi.kotaksecurities.com"
+_NEO_FIN_KEY = "neotradeapi"
+_LOGIN_URL = "https://mis.kotaksecurities.com/login/1.0/tradeApiLogin"
+_VALIDATE_URL = "https://mis.kotaksecurities.com/login/1.0/tradeApiValidate"
+_TOKEN_FILE = Path(".neo_token.json")
+_TOKEN_EXPIRY_HOURS = 20
+_TRANSIENT_STATUS_CODES = {502, 503, 504}
+
+# Map Breeze-style interval strings to Kotak Neo chart resolution values
+_INTERVAL_MAP = {
+    "1minute": "1",
+    "5minute": "5",
+    "15minute": "15",
+    "30minute": "30",
+    "1hour": "60",
+    "1day": "1D",
+}
+
+
+def _post_with_retry(url: str, headers: dict, payload: dict, timeout: int = 30) -> requests.Response:
+    delay = 2
+    for attempt in range(1, 5):
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        if resp.status_code not in _TRANSIENT_STATUS_CODES:
+            return resp
+        logger.warning("HTTP %s from %s (attempt %d/4) — retrying in %ds…", resp.status_code, url, attempt, delay)
+        if attempt < 4:
+            time.sleep(delay)
+            delay *= 2
+    return resp
+
+
+def _load_cached_token() -> Optional[dict]:
+    if not _TOKEN_FILE.exists():
+        return None
+    try:
+        data = json.loads(_TOKEN_FILE.read_text())
+        saved_at = datetime.fromisoformat(data["saved_at"])
+        if datetime.now() - saved_at < timedelta(hours=_TOKEN_EXPIRY_HOURS):
+            logger.info("Using cached Neo session (saved %s)", saved_at.strftime("%H:%M"))
+            return data
+    except Exception as exc:
+        logger.warning("Failed to read cached token: %s", exc)
+    return None
+
+
+def _save_token(trading_token: str, trading_sid: str, base_url: str) -> None:
+    try:
+        _TOKEN_FILE.write_text(json.dumps({
+            "trading_token": trading_token,
+            "trading_sid": trading_sid,
+            "base_url": base_url,
+            "saved_at": datetime.now().isoformat(),
+        }))
+    except Exception as exc:
+        logger.warning("Could not persist token: %s", exc)
+
+
+class KotakNeoClient:
+    """Manages a single Kotak Neo API session."""
+
+    def __init__(self):
+        self._client = None
+
+    # ── Connection ────────────────────────────────────────────────────────────
+
+    def connect(self) -> None:
+        """Authenticate with Kotak Neo (TOTP → MPIN two-step flow) and cache session."""
+        try:
+            import neo_api_client
+        except ImportError as exc:
+            raise RuntimeError("neo-api-client not installed. Run: pip install neo-api-client") from exc
+
+        import inspect
+        all_kwargs = {
+            "consumer_key": NEO_CONSUMER_KEY,
+            "consumer_secret": NEO_CONSUMER_SECRET,
+            "environment": NEO_ENVIRONMENT,
+            "access_token": None,
+            "neo_fin_key": None,
+        }
+        supported = inspect.signature(neo_api_client.NeoAPI.__init__).parameters
+        self._client = neo_api_client.NeoAPI(**{k: v for k, v in all_kwargs.items() if k in supported})
+
+        cached = _load_cached_token()
+        if cached:
+            self._client.access_token = cached["trading_token"]
+            self._client.sid = cached["trading_sid"]
+            self._client.base_url = cached.get("base_url") or _CHART_BASE_URL
+            logger.info("Neo session restored from cache.")
+            return
+
+        # Step 2a: TOTP login
+        mobile = os.getenv("NEO_MOBILE", "").strip() or input("Registered mobile (+91XXXXXXXXXX): ").strip()
+        ucc = (NEO_UCC or os.getenv("NEO_UCC", "")).strip() or input("5-character UCC: ").strip()
+
+        for attempt in range(1, 4):
+            totp = input("TOTP from authenticator app: ").strip()
+            logger.info("Step 2a: TOTP login (attempt %d)…", attempt)
+            resp = _post_with_retry(
+                _LOGIN_URL,
+                headers={"Authorization": NEO_ACCESS_TOKEN, "neo-fin-key": _NEO_FIN_KEY, "Content-Type": "application/json"},
+                payload={"mobileNumber": mobile, "ucc": ucc, "totp": totp},
+            )
+            if resp.status_code == 424 and attempt < 3:
+                print("TOTP rejected — enter the next code.")
+                continue
+            resp.raise_for_status()
+            login_data = resp.json().get("data", {})
+            if login_data.get("status") != "success":
+                raise RuntimeError(f"TOTP login failed: {login_data}")
+            view_token, view_sid = login_data["token"], login_data["sid"]
+            logger.info("TOTP login successful.")
+            break
+
+        # Step 2b: MPIN validation
+        mpin = os.getenv("NEO_MPIN", "").strip()
+        for attempt in range(1, 4):
+            if not mpin:
+                mpin = input("6-digit MPIN: ").strip()
+            logger.info("Step 2b: MPIN validation (attempt %d)…", attempt)
+            resp = _post_with_retry(
+                _VALIDATE_URL,
+                headers={
+                    "Authorization": NEO_ACCESS_TOKEN,
+                    "neo-fin-key": _NEO_FIN_KEY,
+                    "sid": view_sid,
+                    "Auth": view_token,
+                    "Content-Type": "application/json",
+                },
+                payload={"mpin": mpin},
+            )
+            if resp.status_code == 424 and attempt < 3:
+                print("MPIN rejected — re-enter your 6-digit MPIN.")
+                mpin = ""
+                continue
+            resp.raise_for_status()
+            validate_data = resp.json().get("data", {})
+            if validate_data.get("status") != "success":
+                raise RuntimeError(f"MPIN validation failed: {validate_data}")
+            trading_token = validate_data["token"]
+            trading_sid = validate_data["sid"]
+            base_url = validate_data.get("baseUrl") or _CHART_BASE_URL
+            logger.info("MPIN validation successful.")
+            break
+
+        _save_token(trading_token, trading_sid, base_url)
+        self._client.access_token = trading_token
+        self._client.sid = trading_sid
+        self._client.base_url = base_url
+        logger.info("Neo session established.")
+
+    @property
+    def api(self):
+        if self._client is None:
+            raise RuntimeError("KotakNeoClient not connected. Call connect() first.")
+        return self._client
+
+    # ── Market data ───────────────────────────────────────────────────────────
+
+    def get_candles(
+        self,
+        stock_code: str,
+        exchange: str,
+        from_dt: datetime,
+        to_dt: datetime,
+        interval: str = CANDLE_INTERVAL,
+        right: str = "",
+        strike_price: str = "",
+        expiry_date: str = "",
+        product_type: str = "options",
+    ) -> pd.DataFrame:
+        """Fetch OHLCV candles from Kotak Neo chart/history endpoint."""
+        resolution = _INTERVAL_MAP.get(interval, "1")
+
+        # For options, build the trading symbol; otherwise use index symbol directly.
+        if right and strike_price and expiry_date:
+            opt_type = "CE" if right.lower() in ("call", "ce") else "PE"
+            expiry_fmt = datetime.strptime(expiry_date, "%Y-%m-%dT%H:%M:%S.000Z").strftime("%d%b%y").upper()
+            trading_symbol = f"{stock_code}{expiry_fmt}{strike_price}{opt_type}"
+            exchange_segment = "nse_fo"
+        else:
+            trading_symbol = stock_code
+            exchange_segment = "nse_cm" if exchange.upper() == "NSE" else exchange.lower()
+
+        url = f"{_CHART_BASE_URL}/charts/1.0/chart/history"
+        params = {
+            "exchange": exchange_segment,
+            "tradingSymbol": trading_symbol,
+            "from": int(from_dt.timestamp()),
+            "to": int(to_dt.timestamp()),
+            "resolution": resolution,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api.access_token}",
+            "sid": getattr(self.api, "sid", "") or "",
+            "neo-fin-key": _NEO_FIN_KEY,
+            "Content-Type": "application/json",
+        }
+
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=30)
+            resp.raise_for_status()
+            raw = resp.json()
+        except Exception as exc:
+            logger.warning("get_candles failed for %s: %s", stock_code, exc)
+            return pd.DataFrame()
+
+        data = raw if isinstance(raw, dict) else {}
+        if data.get("s") != "ok":
+            logger.warning("No candle data for %s: %s", stock_code, data)
+            return pd.DataFrame()
+
+        timestamps = data.get("t", [])
+        opens = data.get("o", [])
+        highs = data.get("h", [])
+        lows = data.get("l", [])
+        closes = data.get("c", [])
+        volumes = data.get("v", [])
+
+        rows = []
+        for i, ts in enumerate(timestamps):
+            try:
+                rows.append({
+                    "timestamp": datetime.fromtimestamp(int(ts)),
+                    "open": float(opens[i]),
+                    "high": float(highs[i]),
+                    "low": float(lows[i]),
+                    "close": float(closes[i]),
+                    "volume": int(volumes[i]) if i < len(volumes) else 0,
+                })
+            except Exception:
+                continue
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        df.sort_values("timestamp", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    def get_index_ltp(self, stock_code: str = "NIFTY") -> float:
+        """Return the last traded price for an index via Kotak Neo quotes."""
+        try:
+            resp = self.api.quotes(
+                instrument_tokens=[{
+                    "instrument_token": stock_code,
+                    "exchange_segment": "nse_cm",
+                }],
+                quote_type="ltp",
+            )
+            data = resp if isinstance(resp, dict) else (resp[0] if resp else {})
+            ltp = float(data.get("ltp", 0) or data.get("last_price", 0))
+            if ltp:
+                return ltp
+        except Exception as exc:
+            logger.error("get_index_ltp failed for %s: %s", stock_code, exc)
+        raise ValueError(f"Could not fetch LTP for {stock_code}")
+
+    # ── Order management ──────────────────────────────────────────────────────
+
+    def place_order(
+        self,
+        stock_code: str,
+        expiry_date: str,
+        strike_price: str,
+        right: str,          # "call"/"ce" or "put"/"pe"
+        action: str,         # "buy" or "sell"
+        quantity: int,
+        price: float = 0,
+        order_type: str = "market",
+        product: str = "options",
+    ) -> Optional[str]:
+        """
+        Place an options order via Kotak Neo.
+
+        When LIVE_TRADE is False the order is only logged (dry-run mode).
+        Returns the order id string, or None in dry-run mode.
+        """
+        opt_type = "CE" if right.lower() in ("call", "ce") else "PE"
+        try:
+            expiry_fmt = datetime.strptime(expiry_date, "%Y-%m-%dT%H:%M:%S.000Z").strftime("%d%b%y").upper()
+        except ValueError:
+            expiry_fmt = expiry_date
+        trading_symbol = f"{stock_code}{expiry_fmt}{strike_price}{opt_type}"
+        transaction_type = action.upper()
+        neo_order_type = "MKT" if order_type.lower() == "market" else "L"
+
+        order_details = (
+            f"[{transaction_type} {trading_symbol} Qty={quantity}]"
+        )
+
+        if not LIVE_TRADE:
+            if DRY_RUN_LOG:
+                logger.info("DRY-RUN — simulated order: %s", order_details)
+            return None
+
+        try:
+            resp = self.api.place_order(
+                exchange_segment="nse_fo",
+                product="NRML",
+                price=str(price),
+                order_type=neo_order_type,
+                quantity=str(quantity),
+                validity="DAY",
+                trading_symbol=trading_symbol,
+                transaction_type=transaction_type,
+                amo="NO",
+                disclosed_quantity="0",
+                market_protection="0",
+                pf="N",
+                trigger_price="0",
+                tag="NeoADX_Strategy",
+            )
+            order_id = str(resp.get("nOrdNo") or resp.get("order_id", "")) if resp else ""
+            if order_id:
+                logger.info("Order placed %s  order_id=%s", order_details, order_id)
+                return order_id
+            logger.error("Order FAILED %s  response=%s", order_details, resp)
+        except Exception as exc:
+            logger.error("place_order exception %s: %s", order_details, exc)
+        return None
