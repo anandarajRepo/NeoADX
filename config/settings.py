@@ -3,10 +3,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Broker credentials ──────────────────────────────────────────────────────
-BREEZE_API_KEY = os.getenv("BREEZE_API_KEY", "")
-BREEZE_API_SECRET = os.getenv("BREEZE_API_SECRET", "")
-BREEZE_SESSION_TOKEN = os.getenv("BREEZE_SESSION_TOKEN", "")
+# ── Kotak Neo broker credentials ─────────────────────────────────────────────
+NEO_CONSUMER_KEY    = os.getenv("NEO_CONSUMER_KEY", "")
+NEO_CONSUMER_SECRET = os.getenv("NEO_CONSUMER_SECRET", "")
+NEO_ACCESS_TOKEN    = os.getenv("NEO_ACCESS_TOKEN", "")
+NEO_UCC             = os.getenv("NEO_UCC", "")
+NEO_ENVIRONMENT     = os.getenv("NEO_ENVIRONMENT", "prod")
 
 # ── Live-trade toggle ────────────────────────────────────────────────────────
 # When False the strategy logs signals but does NOT send orders to the broker.
@@ -21,7 +23,7 @@ INDEX_EXCHANGE = "NSE"        # Exchange for underlying price feed
 # ── Strategy parameters ──────────────────────────────────────────────────────
 ADX_PERIOD = 16               # ADX / DI lookback period (candles)
 ADX_THRESHOLD = 30.0          # Minimum ADX to take a trade
-CANDLE_INTERVAL = "1minute"   # Breeze API interval string
+CANDLE_INTERVAL = "1minute"   # interval string (mapped to Neo resolution in broker)
 
 # ── Session timings (IST) ────────────────────────────────────────────────────
 MARKET_OPEN_TIME  = "09:15"   # Market opens

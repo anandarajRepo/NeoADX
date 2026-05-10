@@ -2,7 +2,7 @@
 ADX DI+/DI- Crossover Strategy — Nifty 50 Weekly Options
 =========================================================
 Instrument : Nifty 50 weekly CE / PE options (Tuesday expiry)
-Data       : 1-minute candles via ICICI Breeze API
+Data       : 1-minute candles via Kotak Neo API
 Signals    : DI+ crosses above DI- AND ADX >= 30  → Buy CE
              DI- crosses above DI+ AND ADX >= 30  → Buy PE
 Exits      : DI reversal crossover  |  EOD square-off at 15:20
@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 import pytz
 
-from broker.icici_breeze import BreezeClient
+from broker.kotak_neo import KotakNeoClient
 from config.settings import (
     ADX_PERIOD,
     ADX_THRESHOLD,
@@ -95,7 +95,7 @@ class ADXCrossoverStrategy:
                 self.live_trade,
             )
 
-        self.client    = BreezeClient()
+        self.client    = KotakNeoClient()
         self.positions: List[Position] = []
         self.trade_count: Dict[str, int] = {}   # symbol → trades today
         self._running  = False
@@ -113,7 +113,7 @@ class ADXCrossoverStrategy:
         self.live_trade = False
 
     def run(self) -> None:
-        """Connect to Breeze and start the intraday strategy loop."""
+        """Connect to Kotak Neo and start the intraday strategy loop."""
         logger.info(
             "Starting ADX Crossover Strategy | live_trade=%s", self.live_trade
         )
