@@ -141,7 +141,7 @@ class KotakNeoClient:
             logger.info("Step 2a: TOTP login (attempt %d)…", attempt)
             resp = _post_with_retry(
                 _LOGIN_URL,
-                headers={"Authorization": NEO_ACCESS_TOKEN, "neo-fin-key": _NEO_FIN_KEY, "Content-Type": "application/json"},
+                headers={"Authorization": f"Bearer {NEO_ACCESS_TOKEN}", "neo-fin-key": _NEO_FIN_KEY, "Content-Type": "application/json"},
                 payload={"mobileNumber": mobile, "ucc": ucc, "totp": totp},
             )
             if resp.status_code == 424 and attempt < 3:
@@ -164,7 +164,7 @@ class KotakNeoClient:
             resp = _post_with_retry(
                 _VALIDATE_URL,
                 headers={
-                    "Authorization": NEO_ACCESS_TOKEN,
+                    "Authorization": f"Bearer {NEO_ACCESS_TOKEN}",
                     "neo-fin-key": _NEO_FIN_KEY,
                     "sid": view_sid,
                     "Auth": view_token,
