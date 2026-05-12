@@ -74,10 +74,12 @@ def _post_with_retry(url: str, headers: dict, payload: dict, timeout: int = 30) 
         resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
         if resp.status_code not in _TRANSIENT_STATUS_CODES:
             return resp
-        logger.warning("HTTP %s from %s (attempt %d/4) — retrying in %ds…", resp.status_code, url, attempt, delay)
         if attempt < 4:
+            logger.warning("HTTP %s from %s (attempt %d/4) — retrying in %ds…", resp.status_code, url, attempt, delay)
             time.sleep(delay)
             delay *= 2
+        else:
+            logger.warning("HTTP %s from %s (attempt %d/4) — all retries exhausted.", resp.status_code, url, attempt)
     return resp
 
 
@@ -168,6 +170,9 @@ class KotakNeoClient:
                 headers={"Authorization": f"Bearer {access_token}", "neo-fin-key": _NEO_FIN_KEY, "Content-Type": "application/json"},
                 payload={"mobileNumber": mobile, "ucc": ucc, "totp": totp},
             )
+            if resp.status_code in _TRANSIENT_STATUS_CODES and attempt < 3:
+                print(f"Kotak server returned {resp.status_code} — the TOTP may have expired during retries. Enter a fresh code.")
+                continue
             if resp.status_code == 424 and attempt < 3:
                 print("TOTP rejected — enter the next code.")
                 continue
