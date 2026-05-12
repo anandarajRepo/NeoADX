@@ -156,8 +156,12 @@ class KotakNeoClient:
             return
 
         # Step 2a: TOTP login
-        # Generate a fresh access token — NEO_ACCESS_TOKEN in .env is optional override
-        access_token = (NEO_ACCESS_TOKEN or "").strip() or _get_access_token()
+        # NEO_ACCESS_TOKEN in .env is an optional override; ignore placeholder values
+        _raw_token = (NEO_ACCESS_TOKEN or "").strip()
+        if _raw_token and (_raw_token.startswith("your_") or _raw_token.endswith("_here")):
+            logger.warning("NEO_ACCESS_TOKEN looks like a placeholder — generating token via OAuth instead.")
+            _raw_token = ""
+        access_token = _raw_token or _get_access_token()
 
         mobile = os.getenv("NEO_MOBILE", "").strip() or input("Registered mobile (+91XXXXXXXXXX): ").strip()
         ucc = (NEO_UCC or os.getenv("NEO_UCC", "")).strip() or input("5-character UCC: ").strip()
@@ -174,6 +178,14 @@ class KotakNeoClient:
                 print(f"Kotak server returned {resp.status_code} — the TOTP may have expired during retries. Enter a fresh code.")
                 continue
             if resp.status_code == 424 and attempt < 3:
+                body = resp.text
+                if "does not exist" in body or "Consumer key" in body:
+                    logger.error("Login failed HTTP 424 — access token rejected by Kotak: %s", body)
+                    logger.error(
+                        "Fix: remove NEO_ACCESS_TOKEN from .env (or leave it blank) so the OAuth flow "
+                        "auto-generates a token from NEO_CONSUMER_KEY + NEO_CONSUMER_SECRET."
+                    )
+                    resp.raise_for_status()
                 print("TOTP rejected — enter the next code.")
                 continue
             if not resp.ok:
