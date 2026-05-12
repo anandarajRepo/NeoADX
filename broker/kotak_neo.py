@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 _CHART_BASE_URL = "https://gw-napi.kotaksecurities.com"
 _NEO_FIN_KEY = "neotradeapi"
+_OAUTH_URL = "https://napi.kotaksecurities.com/oauth2/1.0/token"
 _LOGIN_URL = "https://mis.kotaksecurities.com/login/1.0/tradeApiLogin"
 _VALIDATE_URL = "https://mis.kotaksecurities.com/login/1.0/tradeApiValidate"
 _TOKEN_FILE = Path(".neo_token.json")
@@ -45,6 +46,26 @@ _INTERVAL_MAP = {
     "1hour": "60",
     "1day": "1D",
 }
+
+
+def _get_access_token() -> str:
+    """Generate a fresh OAuth access token from consumer key + secret."""
+    if not NEO_CONSUMER_KEY or not NEO_CONSUMER_SECRET:
+        raise RuntimeError("NEO_CONSUMER_KEY and NEO_CONSUMER_SECRET must be set in .env")
+    resp = requests.post(
+        _OAUTH_URL,
+        data={"grant_type": "client_credentials"},
+        auth=(NEO_CONSUMER_KEY, NEO_CONSUMER_SECRET),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"OAuth token generation failed HTTP {resp.status_code}: {resp.text}")
+    token = resp.json().get("access_token") or resp.json().get("token")
+    if not token:
+        raise RuntimeError(f"No access_token in OAuth response: {resp.text}")
+    logger.info("OAuth access token generated successfully.")
+    return token
 
 
 def _post_with_retry(url: str, headers: dict, payload: dict, timeout: int = 30) -> requests.Response:
@@ -133,6 +154,9 @@ class KotakNeoClient:
             return
 
         # Step 2a: TOTP login
+        # Generate a fresh access token — NEO_ACCESS_TOKEN in .env is optional override
+        access_token = (NEO_ACCESS_TOKEN or "").strip() or _get_access_token()
+
         mobile = os.getenv("NEO_MOBILE", "").strip() or input("Registered mobile (+91XXXXXXXXXX): ").strip()
         ucc = (NEO_UCC or os.getenv("NEO_UCC", "")).strip() or input("5-character UCC: ").strip()
 
@@ -141,12 +165,14 @@ class KotakNeoClient:
             logger.info("Step 2a: TOTP login (attempt %d)…", attempt)
             resp = _post_with_retry(
                 _LOGIN_URL,
-                headers={"Authorization": f"Bearer {NEO_ACCESS_TOKEN}", "neo-fin-key": _NEO_FIN_KEY, "Content-Type": "application/json"},
+                headers={"Authorization": f"Bearer {access_token}", "neo-fin-key": _NEO_FIN_KEY, "Content-Type": "application/json"},
                 payload={"mobileNumber": mobile, "ucc": ucc, "totp": totp},
             )
             if resp.status_code == 424 and attempt < 3:
                 print("TOTP rejected — enter the next code.")
                 continue
+            if not resp.ok:
+                logger.error("Login failed HTTP %s: %s", resp.status_code, resp.text)
             resp.raise_for_status()
             login_data = resp.json().get("data", {})
             if login_data.get("status") != "success":
@@ -164,7 +190,7 @@ class KotakNeoClient:
             resp = _post_with_retry(
                 _VALIDATE_URL,
                 headers={
-                    "Authorization": f"Bearer {NEO_ACCESS_TOKEN}",
+                    "Authorization": f"Bearer {access_token}",
                     "neo-fin-key": _NEO_FIN_KEY,
                     "sid": view_sid,
                     "Auth": view_token,
