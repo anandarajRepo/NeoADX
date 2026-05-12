@@ -68,28 +68,12 @@ def _get_access_token_via_library() -> str:
     supported = inspect.signature(neo_api_client.NeoAPI.__init__).parameters
     client = neo_api_client.NeoAPI(**{k: v for k, v in all_kwargs.items() if k in supported})
 
-    # Try common attribute paths used by different versions of neo-api-client
-    token = (
-        getattr(client, "access_token", None)
-        or getattr(client, "token", None)
-        or getattr(getattr(client, "configuration", None), "access_token", None)
-    )
-
-    # Some versions expose a getter method
-    if not token and callable(getattr(client, "get_access_token", None)):
-        try:
-            token = client.get_access_token()
-        except Exception:
-            pass
-
+    # The library stores the OAuth token on the instance after __init__
+    token = getattr(client, "access_token", None) or getattr(client, "token", None)
     if not token:
-        # Log available attributes to help diagnose future version mismatches
-        attrs = [a for a in dir(client) if not a.startswith("__") and "token" in a.lower()]
-        logger.debug("neo-api-client token-related attributes: %s", attrs)
         raise RuntimeError(
             "neo-api-client did not expose an access_token after init. "
-            "Set NEO_ACCESS_TOKEN in .env with a valid token from Kotak's developer portal "
-            "(https://developer.kotaksecurities.com)."
+            "Set NEO_ACCESS_TOKEN in .env with a token from Kotak's developer portal."
         )
     logger.info("OAuth access token obtained via neo-api-client.")
     return token, client
