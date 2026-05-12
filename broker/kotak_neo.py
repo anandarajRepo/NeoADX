@@ -86,6 +86,18 @@ def _save_token(trading_token: str, trading_sid: str, base_url: str) -> None:
         logger.warning("Could not persist token: %s", exc)
 
 
+def auth() -> None:
+    """Authenticate with Kotak Neo and cache the session token.
+
+    Convenience wrapper around ``KotakNeoClient.connect()``.  Call this once
+    before market open to complete the interactive TOTP + MPIN flow so that
+    subsequent strategy runs start without any prompts.
+    """
+    client = KotakNeoClient()
+    client.connect()
+    logger.info("Authentication successful — session token cached.")
+
+
 class KotakNeoClient:
     """Manages a single Kotak Neo API session."""
 
