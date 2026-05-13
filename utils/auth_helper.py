@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 _TOKEN_FILE = Path(".neo_token.json")
 _TOKEN_EXPIRY_HOURS = 20
 
-_OAUTH_URL = "https://napi.kotaksecurities.com/oauth2/1.0/token"
+_OAUTH_URL = "https://napi.kotaksecurities.com/oauth2/token"
 _LOGIN_URL = "https://mis.kotaksecurities.com/login/1.0/tradeApiLogin"
 _VALIDATE_URL = "https://mis.kotaksecurities.com/login/1.0/tradeApiValidate"
 _DEFAULT_BASE_URL = "https://gw-napi.kotaksecurities.com"
