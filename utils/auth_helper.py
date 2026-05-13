@@ -5,11 +5,9 @@ Handles the two-step login flow:
   Step 2a: POST /tradeApiLogin  — TOTP verification → VIEW_TOKEN + VIEW_SID
   Step 2b: POST /tradeApiValidate — MPIN validation  → TRADING_TOKEN + TRADING_SID + BASE_URL
 
-Credentials required (via env or interactive prompt):
-  NEO_ACCESS_TOKEN  Developer API access token (Authorization header in auth requests)
-  NEO_MOBILE        Registered mobile with country code, e.g. +91XXXXXXXXXX
-  NEO_UCC           5-character client code from the developer portal
-  NEO_MPIN          6-digit MPIN (optional; prompted interactively if absent)
+Access token resolution (in order):
+  1. NEO_ACCESS_TOKEN in .env (if set and not a placeholder)
+  2. Auto-generated via OAuth using NEO_CONSUMER_KEY + NEO_CONSUMER_SECRET
 
 Trading session values (TRADING_TOKEN, TRADING_SID, BASE_URL) are persisted to
 .neo_token.json and reused for up to 20 hours.
@@ -41,6 +39,7 @@ logger = logging.getLogger(__name__)
 _TOKEN_FILE = Path(".neo_token.json")
 _TOKEN_EXPIRY_HOURS = 20
 
+_OAUTH_URL = "https://napi.kotaksecurities.com/oauth2/1.0/token"
 _LOGIN_URL = "https://mis.kotaksecurities.com/login/1.0/tradeApiLogin"
 _VALIDATE_URL = "https://mis.kotaksecurities.com/login/1.0/tradeApiValidate"
 _DEFAULT_BASE_URL = "https://gw-napi.kotaksecurities.com"
@@ -84,6 +83,39 @@ def _save_token(trading_token: str, trading_sid: str, base_url: str) -> None:
         }))
     except Exception as exc:
         logger.warning("Could not persist token: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# OAuth access token generation
+# ---------------------------------------------------------------------------
+
+def _get_access_token() -> str:
+    """Generate a fresh OAuth access token from consumer key + secret."""
+    if not NEO_CONSUMER_KEY or not NEO_CONSUMER_SECRET:
+        raise RuntimeError("NEO_CONSUMER_KEY and NEO_CONSUMER_SECRET must be set in .env")
+    resp = requests.post(
+        _OAUTH_URL,
+        data={"grant_type": "client_credentials"},
+        auth=(NEO_CONSUMER_KEY, NEO_CONSUMER_SECRET),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"OAuth token generation failed HTTP {resp.status_code}: {resp.text}")
+    token = resp.json().get("access_token") or resp.json().get("token")
+    if not token:
+        raise RuntimeError(f"No access_token in OAuth response: {resp.text}")
+    logger.info("OAuth access token generated successfully.")
+    return token
+
+
+def _resolve_access_token() -> str:
+    """Return NEO_ACCESS_TOKEN from env, or auto-generate via OAuth if absent/placeholder."""
+    raw = (NEO_ACCESS_TOKEN or "").strip()
+    if raw and (raw.startswith("your_") or raw.endswith("_here")):
+        logger.warning("NEO_ACCESS_TOKEN looks like a placeholder — generating token via OAuth instead.")
+        raw = ""
+    return raw or _get_access_token()
 
 
 # ---------------------------------------------------------------------------
@@ -217,13 +249,8 @@ def get_neo_client():
             logger.warning("Cached base_url is None — using default: %s", _DEFAULT_BASE_URL)
         return client
 
-    # ── Validate access token ─────────────────────────────────────────────
-    access_token = (NEO_ACCESS_TOKEN or "").strip()
-    if not access_token:
-        raise RuntimeError(
-            "NEO_ACCESS_TOKEN is not set. Add it to your .env file.\n"
-            "Get your token from: https://developer.kotaksecurities.com"
-        )
+    # ── Resolve access token (env override or auto-generate via OAuth) ────
+    access_token = _resolve_access_token()
 
     # ── Gather credentials ────────────────────────────────────────────────
     mobile = os.getenv("NEO_MOBILE", "").strip()
@@ -245,6 +272,14 @@ def get_neo_client():
             break
         except requests.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == 424 and attempt < 3:
+                body = exc.response.text
+                if "does not exist" in body or "Consumer key" in body:
+                    logger.error(
+                        "Access token rejected by Kotak (HTTP 424): %s\n"
+                        "Fix: remove NEO_ACCESS_TOKEN from .env so OAuth auto-generates it.",
+                        body,
+                    )
+                    raise
                 print("TOTP rejected (expired or invalid) — please enter the next code.")
                 continue
             raise
