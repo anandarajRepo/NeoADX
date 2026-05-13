@@ -95,8 +95,11 @@ def _get_access_token() -> str:
         raise RuntimeError("NEO_CONSUMER_KEY and NEO_CONSUMER_SECRET must be set in .env")
     resp = requests.post(
         _OAUTH_URL,
-        data={"grant_type": "client_credentials"},
-        auth=(NEO_CONSUMER_KEY, NEO_CONSUMER_SECRET),
+        data={
+            "grant_type": "client_credentials",
+            "client_id": NEO_CONSUMER_KEY,
+            "client_secret": NEO_CONSUMER_SECRET,
+        },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=30,
     )
