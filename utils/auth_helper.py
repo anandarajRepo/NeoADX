@@ -90,18 +90,50 @@ def _save_token(trading_token: str, trading_sid: str, base_url: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _get_access_token() -> str:
-    """Generate a fresh OAuth access token from consumer key + secret."""
+    """Generate a fresh OAuth access token from consumer key + secret.
+
+    Tries two credential formats accepted by WSO2 API Manager:
+      1. client_id / client_secret as form fields (WSO2 form-post method)
+      2. HTTP Basic Auth header as fallback
+    """
     if not NEO_CONSUMER_KEY or not NEO_CONSUMER_SECRET:
         raise RuntimeError("NEO_CONSUMER_KEY and NEO_CONSUMER_SECRET must be set in .env")
+
+    _headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    # Attempt 1: WSO2 form-post — client_id + client_secret in request body
     resp = requests.post(
         _OAUTH_URL,
-        data={"grant_type": "client_credentials"},
-        auth=(NEO_CONSUMER_KEY, NEO_CONSUMER_SECRET),
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "grant_type": "client_credentials",
+            "client_id": NEO_CONSUMER_KEY,
+            "client_secret": NEO_CONSUMER_SECRET,
+        },
+        headers=_headers,
         timeout=30,
     )
+
     if not resp.ok:
-        raise RuntimeError(f"OAuth token generation failed HTTP {resp.status_code}: {resp.text}")
+        logger.debug(
+            "OAuth form-post failed HTTP %s — retrying with Basic Auth: %s",
+            resp.status_code, resp.text,
+        )
+        # Attempt 2: standard Basic Auth header
+        resp = requests.post(
+            _OAUTH_URL,
+            data={"grant_type": "client_credentials"},
+            auth=(NEO_CONSUMER_KEY, NEO_CONSUMER_SECRET),
+            headers=_headers,
+            timeout=30,
+        )
+
+    if not resp.ok:
+        raise RuntimeError(
+            f"OAuth token generation failed HTTP {resp.status_code}: {resp.text}\n"
+            "Hint: If this keeps failing, generate the access token manually from the\n"
+            "Kotak WSO2 portal and set it as NEO_ACCESS_TOKEN in your .env file."
+        )
+
     token = resp.json().get("access_token") or resp.json().get("token")
     if not token:
         raise RuntimeError(f"No access_token in OAuth response: {resp.text}")
