@@ -2,40 +2,26 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-import time
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 from typing import Optional
 
 import pandas as pd
 import requests
 
 from config.settings import (
-    NEO_CONSUMER_KEY,
-    NEO_CONSUMER_SECRET,
-    NEO_ACCESS_TOKEN,
-    NEO_UCC,
-    NEO_ENVIRONMENT,
     CANDLE_INTERVAL,
     EXCHANGE,
     INDEX_EXCHANGE,
     LIVE_TRADE,
     DRY_RUN_LOG,
 )
+from utils.auth_helper import get_neo_client, refresh_if_needed
 
 logger = logging.getLogger(__name__)
 
 _CHART_BASE_URL = "https://gw-napi.kotaksecurities.com"
 _NEO_FIN_KEY = "neotradeapi"
-_OAUTH_URL = "https://napi.kotaksecurities.com/oauth2/1.0/token"
-_LOGIN_URL = "https://mis.kotaksecurities.com/login/1.0/tradeApiLogin"
-_VALIDATE_URL = "https://mis.kotaksecurities.com/login/1.0/tradeApiValidate"
-_TOKEN_FILE = Path(".neo_token.json")
-_TOKEN_EXPIRY_HOURS = 20
-_TRANSIENT_STATUS_CODES = {502, 503, 504}
 
 # Map Breeze-style interval strings to Kotak Neo chart resolution values
 _INTERVAL_MAP = {
@@ -48,76 +34,9 @@ _INTERVAL_MAP = {
 }
 
 
-def _get_access_token() -> str:
-    """Generate a fresh OAuth access token from consumer key + secret."""
-    if not NEO_CONSUMER_KEY or not NEO_CONSUMER_SECRET:
-        raise RuntimeError("NEO_CONSUMER_KEY and NEO_CONSUMER_SECRET must be set in .env")
-    resp = requests.post(
-        _OAUTH_URL,
-        data={"grant_type": "client_credentials"},
-        auth=(NEO_CONSUMER_KEY, NEO_CONSUMER_SECRET),
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=30,
-    )
-    if not resp.ok:
-        raise RuntimeError(f"OAuth token generation failed HTTP {resp.status_code}: {resp.text}")
-    token = resp.json().get("access_token") or resp.json().get("token")
-    if not token:
-        raise RuntimeError(f"No access_token in OAuth response: {resp.text}")
-    logger.info("OAuth access token generated successfully.")
-    return token
-
-
-def _post_with_retry(url: str, headers: dict, payload: dict, timeout: int = 30) -> requests.Response:
-    delay = 2
-    for attempt in range(1, 5):
-        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        if resp.status_code not in _TRANSIENT_STATUS_CODES:
-            return resp
-        if attempt < 4:
-            logger.warning("HTTP %s from %s (attempt %d/4) — retrying in %ds…", resp.status_code, url, attempt, delay)
-            time.sleep(delay)
-            delay *= 2
-        else:
-            logger.warning("HTTP %s from %s (attempt %d/4) — all retries exhausted.", resp.status_code, url, attempt)
-    return resp
-
-
-def _load_cached_token() -> Optional[dict]:
-    if not _TOKEN_FILE.exists():
-        return None
-    try:
-        data = json.loads(_TOKEN_FILE.read_text())
-        saved_at = datetime.fromisoformat(data["saved_at"])
-        if datetime.now() - saved_at < timedelta(hours=_TOKEN_EXPIRY_HOURS):
-            logger.info("Using cached Neo session (saved %s)", saved_at.strftime("%H:%M"))
-            return data
-    except Exception as exc:
-        logger.warning("Failed to read cached token: %s", exc)
-    return None
-
-
-def _save_token(trading_token: str, trading_sid: str, base_url: str) -> None:
-    try:
-        _TOKEN_FILE.write_text(json.dumps({
-            "trading_token": trading_token,
-            "trading_sid": trading_sid,
-            "base_url": base_url,
-            "saved_at": datetime.now().isoformat(),
-        }))
-    except Exception as exc:
-        logger.warning("Could not persist token: %s", exc)
-
-
 def auth() -> None:
-    """Authenticate with Kotak Neo and cache the session token.
-
-    Convenience wrapper around ``KotakNeoClient.connect()``.  Call this once
-    before market open to complete the interactive TOTP + MPIN flow so that
-    subsequent strategy runs start without any prompts.
-    """
-    client = KotakNeoClient()
-    client.connect()
+    """Authenticate with Kotak Neo and cache the session token."""
+    get_neo_client()
     logger.info("Authentication successful — session token cached.")
 
 
@@ -131,109 +50,13 @@ class KotakNeoClient:
 
     def connect(self) -> None:
         """Authenticate with Kotak Neo (TOTP → MPIN two-step flow) and cache session."""
-        try:
-            import neo_api_client
-        except ImportError as exc:
-            raise RuntimeError("neo-api-client not installed. Run: pip install neo-api-client") from exc
-
-        import inspect
-        all_kwargs = {
-            "consumer_key": NEO_CONSUMER_KEY,
-            "consumer_secret": NEO_CONSUMER_SECRET,
-            "environment": NEO_ENVIRONMENT,
-            "access_token": None,
-            "neo_fin_key": None,
-        }
-        supported = inspect.signature(neo_api_client.NeoAPI.__init__).parameters
-        self._client = neo_api_client.NeoAPI(**{k: v for k, v in all_kwargs.items() if k in supported})
-
-        cached = _load_cached_token()
-        if cached:
-            self._client.access_token = cached["trading_token"]
-            self._client.sid = cached["trading_sid"]
-            self._client.base_url = cached.get("base_url") or _CHART_BASE_URL
-            logger.info("Neo session restored from cache.")
-            return
-
-        # Step 2a: TOTP login
-        # NEO_ACCESS_TOKEN in .env is an optional override; ignore placeholder values
-        _raw_token = (NEO_ACCESS_TOKEN or "").strip()
-        if _raw_token and (_raw_token.startswith("your_") or _raw_token.endswith("_here")):
-            logger.warning("NEO_ACCESS_TOKEN looks like a placeholder — generating token via OAuth instead.")
-            _raw_token = ""
-        access_token = _raw_token or _get_access_token()
-
-        mobile = os.getenv("NEO_MOBILE", "").strip() or input("Registered mobile (+91XXXXXXXXXX): ").strip()
-        ucc = (NEO_UCC or os.getenv("NEO_UCC", "")).strip() or input("5-character UCC: ").strip()
-
-        for attempt in range(1, 4):
-            totp = input("TOTP from authenticator app: ").strip()
-            logger.info("Step 2a: TOTP login (attempt %d)…", attempt)
-            resp = _post_with_retry(
-                _LOGIN_URL,
-                headers={"Authorization": f"Bearer {access_token}", "neo-fin-key": _NEO_FIN_KEY, "Content-Type": "application/json"},
-                payload={"mobileNumber": mobile, "ucc": ucc, "totp": totp},
-            )
-            if resp.status_code in _TRANSIENT_STATUS_CODES and attempt < 3:
-                print(f"Kotak server returned {resp.status_code} — the TOTP may have expired during retries. Enter a fresh code.")
-                continue
-            if resp.status_code == 424 and attempt < 3:
-                body = resp.text
-                if "does not exist" in body or "Consumer key" in body:
-                    logger.error("Login failed HTTP 424 — access token rejected by Kotak: %s", body)
-                    logger.error(
-                        "Fix: remove NEO_ACCESS_TOKEN from .env (or leave it blank) so the OAuth flow "
-                        "auto-generates a token from NEO_CONSUMER_KEY + NEO_CONSUMER_SECRET."
-                    )
-                    resp.raise_for_status()
-                print("TOTP rejected — enter the next code.")
-                continue
-            if not resp.ok:
-                logger.error("Login failed HTTP %s: %s", resp.status_code, resp.text)
-            resp.raise_for_status()
-            login_data = resp.json().get("data", {})
-            if login_data.get("status") != "success":
-                raise RuntimeError(f"TOTP login failed: {login_data}")
-            view_token, view_sid = login_data["token"], login_data["sid"]
-            logger.info("TOTP login successful.")
-            break
-
-        # Step 2b: MPIN validation
-        mpin = os.getenv("NEO_MPIN", "").strip()
-        for attempt in range(1, 4):
-            if not mpin:
-                mpin = input("6-digit MPIN: ").strip()
-            logger.info("Step 2b: MPIN validation (attempt %d)…", attempt)
-            resp = _post_with_retry(
-                _VALIDATE_URL,
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "neo-fin-key": _NEO_FIN_KEY,
-                    "sid": view_sid,
-                    "Auth": view_token,
-                    "Content-Type": "application/json",
-                },
-                payload={"mpin": mpin},
-            )
-            if resp.status_code == 424 and attempt < 3:
-                print("MPIN rejected — re-enter your 6-digit MPIN.")
-                mpin = ""
-                continue
-            resp.raise_for_status()
-            validate_data = resp.json().get("data", {})
-            if validate_data.get("status") != "success":
-                raise RuntimeError(f"MPIN validation failed: {validate_data}")
-            trading_token = validate_data["token"]
-            trading_sid = validate_data["sid"]
-            base_url = validate_data.get("baseUrl") or _CHART_BASE_URL
-            logger.info("MPIN validation successful.")
-            break
-
-        _save_token(trading_token, trading_sid, base_url)
-        self._client.access_token = trading_token
-        self._client.sid = trading_sid
-        self._client.base_url = base_url
+        self._client = get_neo_client()
         logger.info("Neo session established.")
+
+    def refresh_session(self) -> None:
+        """Re-authenticate if the cached token has expired."""
+        if self._client is not None:
+            refresh_if_needed(self._client)
 
     @property
     def api(self):
