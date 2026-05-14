@@ -301,8 +301,7 @@ def get_neo_client():
                 continue
             raise
 
-    _save_token(trading_token, trading_sid, base_url)
-    logger.info("Authentication successful. Trading session cached.")
+    logger.info("Authentication successful.")
 
     client.access_token = trading_token
     client.sid = trading_sid
