@@ -48,9 +48,9 @@ class KotakNeoClient:
 
     # ── Connection ────────────────────────────────────────────────────────────
 
-    def connect(self) -> None:
+    def connect(self, force: bool = False) -> None:
         """Authenticate with Kotak Neo (TOTP → MPIN two-step flow) and cache session."""
-        self._client = get_neo_client()
+        self._client = get_neo_client(force=force)
         logger.info("Neo session established.")
 
     def refresh_session(self) -> None:

@@ -234,12 +234,15 @@ def _do_mpin_validate(
 # Public API
 # ---------------------------------------------------------------------------
 
-def get_neo_client():
+def get_neo_client(force: bool = False):
     """
     Return an authenticated Kotak Neo API client.
 
     Performs the two-step authentication (TOTP → MPIN) on first run or after
     token expiry, then caches the trading session for subsequent runs.
+
+    Pass force=True to skip the cached token and re-authenticate unconditionally
+    (used by the `auth` CLI command).
 
     Returns a neo_api_client.NeoAPI instance with access_token, sid, and
     base_url set from the authenticated trading session.
@@ -261,7 +264,7 @@ def get_neo_client():
     supported = inspect.signature(neo_api_client.NeoAPI.__init__).parameters
     client = neo_api_client.NeoAPI(**{k: v for k, v in all_kwargs.items() if k in supported})
 
-    cached = _load_cached_token()
+    cached = None if force else _load_cached_token()
     if cached:
         client.access_token = cached["trading_token"]
         client.sid = cached["trading_sid"]
