@@ -69,7 +69,7 @@ def cmd_auth() -> None:
     """Authenticate with Kotak Neo and persist the session token."""
     from broker.kotak_neo import KotakNeoClient
     client = KotakNeoClient()
-    client.connect()
+    client.connect(force=True)
     logger.info("Authentication successful — session token cached.")
 
 
