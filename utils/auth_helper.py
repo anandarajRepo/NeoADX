@@ -9,16 +9,16 @@ Access token resolution (in order):
   1. NEO_ACCESS_TOKEN in .env (if set and not a placeholder)
   2. Auto-generated via OAuth using NEO_CONSUMER_KEY + NEO_CONSUMER_SECRET
 
-Trading session values (TRADING_TOKEN, TRADING_SID, BASE_URL) are persisted to
-.neo_token.json and reused for up to 20 hours.
+Trading session values (NEO_TRADING_TOKEN, NEO_TRADING_SID, NEO_BASE_URL) are
+persisted back into .env and reused for up to 20 hours.
 """
 
 from __future__ import annotations
 
 import inspect
-import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -36,7 +36,7 @@ from config.settings import (
 
 logger = logging.getLogger(__name__)
 
-_TOKEN_FILE = Path(".neo_token.json")
+_ENV_FILE = Path(".env")
 _TOKEN_EXPIRY_HOURS = 20
 
 _OAUTH_URL = "https://napi.kotaksecurities.com/oauth2/token"
@@ -50,39 +50,60 @@ _MAX_TRANSIENT_RETRIES = 4
 
 
 # ---------------------------------------------------------------------------
-# Token cache helpers
+# Token cache helpers — persisted in .env
 # ---------------------------------------------------------------------------
 
 def _load_cached_token() -> Optional[dict]:
-    """Return cached session dict if still valid, else None."""
-    if not _TOKEN_FILE.exists():
+    """Return cached session dict from .env if still valid, else None."""
+    trading_token = os.getenv("NEO_TRADING_TOKEN", "").strip()
+    trading_sid = os.getenv("NEO_TRADING_SID", "").strip()
+    base_url = os.getenv("NEO_BASE_URL", "").strip()
+    saved_at_str = os.getenv("NEO_TOKEN_SAVED_AT", "").strip()
+
+    if not trading_token or not saved_at_str:
         return None
     try:
-        data = json.loads(_TOKEN_FILE.read_text())
-        saved_at = datetime.fromisoformat(data["saved_at"])
+        saved_at = datetime.fromisoformat(saved_at_str)
         if datetime.now() - saved_at < timedelta(hours=_TOKEN_EXPIRY_HOURS):
             logger.info("Using cached Neo session (saved %s)", saved_at.strftime("%H:%M"))
             return {
-                "trading_token": data["trading_token"],
-                "trading_sid": data["trading_sid"],
-                "base_url": data["base_url"],
+                "trading_token": trading_token,
+                "trading_sid": trading_sid,
+                "base_url": base_url,
             }
         logger.info("Cached token expired — re-authenticating")
     except Exception as exc:
-        logger.warning("Failed to read cached token: %s", exc)
+        logger.warning("Failed to read cached token from .env: %s", exc)
     return None
 
 
+def _set_env_var(content: str, key: str, value: str) -> str:
+    """Set or update a KEY=value line in .env file content."""
+    pattern = re.compile(rf"^{re.escape(key)}\s*=.*$", re.MULTILINE)
+    replacement = f"{key}={value}"
+    if pattern.search(content):
+        return pattern.sub(replacement, content)
+    separator = "\n" if content and not content.endswith("\n") else ""
+    return content + separator + replacement + "\n"
+
+
 def _save_token(trading_token: str, trading_sid: str, base_url: str) -> None:
+    """Persist trading session values into .env, overriding any previous values."""
     try:
-        _TOKEN_FILE.write_text(json.dumps({
-            "trading_token": trading_token,
-            "trading_sid": trading_sid,
-            "base_url": base_url,
-            "saved_at": datetime.now().isoformat(),
-        }))
+        content = _ENV_FILE.read_text() if _ENV_FILE.exists() else ""
+        content = _set_env_var(content, "NEO_TRADING_TOKEN", trading_token)
+        content = _set_env_var(content, "NEO_TRADING_SID", trading_sid)
+        content = _set_env_var(content, "NEO_BASE_URL", base_url)
+        content = _set_env_var(content, "NEO_TOKEN_SAVED_AT", datetime.now().isoformat())
+        _ENV_FILE.write_text(content)
+        # Reflect changes in current process env so subsequent reads work
+        os.environ["NEO_TRADING_TOKEN"] = trading_token
+        os.environ["NEO_TRADING_SID"] = trading_sid
+        os.environ["NEO_BASE_URL"] = base_url
+        os.environ["NEO_TOKEN_SAVED_AT"] = datetime.now().isoformat()
+        logger.info("Trading token saved to .env")
     except Exception as exc:
-        logger.warning("Could not persist token: %s", exc)
+        logger.warning("Could not persist token to .env: %s", exc)
 
 
 # ---------------------------------------------------------------------------
