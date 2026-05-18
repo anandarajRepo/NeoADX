@@ -3,36 +3,17 @@
 from __future__ import annotations
 
 import logging
-import time
 from datetime import datetime
 from typing import Optional
 
-import pandas as pd
-import requests
-
 from config.settings import (
-    CANDLE_INTERVAL,
     EXCHANGE,
-    INDEX_EXCHANGE,
     LIVE_TRADE,
     DRY_RUN_LOG,
 )
 from utils.auth_helper import get_neo_client, refresh_if_needed
 
 logger = logging.getLogger(__name__)
-
-_CHART_BASE_URL = "https://gw-napi.kotaksecurities.com"
-_NEO_FIN_KEY = "neotradeapi"
-
-# Map Breeze-style interval strings to Kotak Neo chart resolution values
-_INTERVAL_MAP = {
-    "1minute": "1",
-    "5minute": "5",
-    "15minute": "15",
-    "30minute": "30",
-    "1hour": "60",
-    "1day": "1D",
-}
 
 
 def auth() -> None:
@@ -66,120 +47,6 @@ class KotakNeoClient:
         return self._client
 
     # ── Market data ───────────────────────────────────────────────────────────
-
-    def get_candles(
-        self,
-        stock_code: str,
-        exchange: str,
-        from_dt: datetime,
-        to_dt: datetime,
-        interval: str = CANDLE_INTERVAL,
-        right: str = "",
-        strike_price: str = "",
-        expiry_date: str = "",
-        product_type: str = "options",
-    ) -> pd.DataFrame:
-        """Fetch OHLCV candles from Kotak Neo chart/history endpoint."""
-        resolution = _INTERVAL_MAP.get(interval, "1")
-
-        # For options, build the trading symbol; otherwise use index symbol directly.
-        if right and strike_price and expiry_date:
-            opt_type = "CE" if right.lower() in ("call", "ce") else "PE"
-            expiry_fmt = datetime.strptime(expiry_date, "%Y-%m-%dT%H:%M:%S.000Z").strftime("%d%b%y").upper()
-            trading_symbol = f"{stock_code}{expiry_fmt}{strike_price}{opt_type}"
-            exchange_segment = "nse_fo"
-        else:
-            trading_symbol = stock_code
-            if exchange.upper() == "NSE":
-                # Indices (NIFTY, BANKNIFTY, …) live on nse_idx; equities on nse_cm.
-                _INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"}
-                exchange_segment = "nse_idx" if stock_code.upper() in _INDEX_SYMBOLS else "nse_cm"
-            else:
-                exchange_segment = exchange.lower()
-
-        url = f"{_CHART_BASE_URL}/charts/1.0/chart/history"
-        params = {
-            "exchange": exchange_segment,
-            "tradingSymbol": trading_symbol,
-            "from": int(from_dt.timestamp()),
-            "to": int(to_dt.timestamp()),
-            "resolution": resolution,
-        }
-        sid = getattr(self.api, "sid", "") or ""
-        logger.debug(
-            "chart/history request: symbol=%s exchange=%s sid_present=%s",
-            trading_symbol, exchange_segment, bool(sid),
-        )
-        headers = {
-            "Authorization": f"Bearer {self.api.access_token}",
-            "sid": sid,
-            "neo-fin-key": _NEO_FIN_KEY,
-        }
-
-        _TRANSIENT = {502, 503, 504}
-        delay = 2
-        raw = None
-        for attempt in range(1, 4):
-            try:
-                resp = requests.get(url, params=params, headers=headers, timeout=30)
-                if resp.status_code in _TRANSIENT and attempt < 3:
-                    logger.warning(
-                        "get_candles transient HTTP %s for %s (attempt %d/3) — retry in %ds",
-                        resp.status_code, stock_code, attempt, delay,
-                    )
-                    time.sleep(delay)
-                    delay *= 2
-                    continue
-                resp.raise_for_status()
-                raw = resp.json()
-                break
-            except Exception as exc:
-                if attempt < 3:
-                    logger.warning(
-                        "get_candles failed for %s (attempt %d/3): %s — retry in %ds",
-                        stock_code, attempt, exc, delay,
-                    )
-                    time.sleep(delay)
-                    delay *= 2
-                else:
-                    logger.warning("get_candles failed for %s: %s", stock_code, exc)
-                    return pd.DataFrame()
-        if raw is None:
-            return pd.DataFrame()
-
-        data = raw if isinstance(raw, dict) else {}
-        if data.get("s") != "ok":
-            logger.warning("No candle data for %s: %s", stock_code, data)
-            return pd.DataFrame()
-
-        timestamps = data.get("t", [])
-        opens = data.get("o", [])
-        highs = data.get("h", [])
-        lows = data.get("l", [])
-        closes = data.get("c", [])
-        volumes = data.get("v", [])
-
-        rows = []
-        for i, ts in enumerate(timestamps):
-            try:
-                rows.append({
-                    "timestamp": datetime.fromtimestamp(int(ts)),
-                    "open": float(opens[i]),
-                    "high": float(highs[i]),
-                    "low": float(lows[i]),
-                    "close": float(closes[i]),
-                    "volume": int(volumes[i]) if i < len(volumes) else 0,
-                })
-            except Exception:
-                continue
-
-        if not rows:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(rows)
-        df.sort_values("timestamp", inplace=True)
-        df.reset_index(drop=True, inplace=True)
-        return df
 
     def get_index_ltp(self, stock_code: str = "NIFTY") -> float:
         """Return the last traded price for an index via Kotak Neo quotes."""
