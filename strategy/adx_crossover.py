@@ -283,6 +283,9 @@ class ADXCrossoverStrategy:
         """Fetch today's 1-minute candles for *symbol*."""
         now_ist   = datetime.now(IST)
         today_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+        if now_ist < today_open:
+            logger.debug("Market not yet open; skipping candle fetch for %s", symbol)
+            return pd.DataFrame()
         return self.client.get_candles(
             stock_code=symbol,
             exchange=exchange,
