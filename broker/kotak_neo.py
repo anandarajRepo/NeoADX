@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -104,19 +105,46 @@ class KotakNeoClient:
             "to": int(to_dt.timestamp()),
             "resolution": resolution,
         }
+        sid = getattr(self.api, "sid", "") or ""
+        logger.debug(
+            "chart/history request: symbol=%s exchange=%s sid_present=%s",
+            trading_symbol, exchange_segment, bool(sid),
+        )
         headers = {
             "Authorization": f"Bearer {self.api.access_token}",
-            "sid": getattr(self.api, "sid", "") or "",
+            "sid": sid,
             "neo-fin-key": _NEO_FIN_KEY,
-            "Content-Type": "application/json",
         }
 
-        try:
-            resp = requests.get(url, params=params, headers=headers, timeout=30)
-            resp.raise_for_status()
-            raw = resp.json()
-        except Exception as exc:
-            logger.warning("get_candles failed for %s: %s", stock_code, exc)
+        _TRANSIENT = {502, 503, 504}
+        delay = 2
+        raw = None
+        for attempt in range(1, 4):
+            try:
+                resp = requests.get(url, params=params, headers=headers, timeout=30)
+                if resp.status_code in _TRANSIENT and attempt < 3:
+                    logger.warning(
+                        "get_candles transient HTTP %s for %s (attempt %d/3) — retry in %ds",
+                        resp.status_code, stock_code, attempt, delay,
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                resp.raise_for_status()
+                raw = resp.json()
+                break
+            except Exception as exc:
+                if attempt < 3:
+                    logger.warning(
+                        "get_candles failed for %s (attempt %d/3): %s — retry in %ds",
+                        stock_code, attempt, exc, delay,
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    logger.warning("get_candles failed for %s: %s", stock_code, exc)
+                    return pd.DataFrame()
+        if raw is None:
             return pd.DataFrame()
 
         data = raw if isinstance(raw, dict) else {}
