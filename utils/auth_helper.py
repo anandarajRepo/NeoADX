@@ -271,6 +271,9 @@ def get_neo_client(force: bool = False):
         client.base_url = cached["base_url"] or _DEFAULT_BASE_URL
         if not cached["base_url"]:
             logger.warning("Cached base_url is None — using default: %s", _DEFAULT_BASE_URL)
+        # Required for WebSocket subscribe() — SDK checks configuration.edit_token/edit_sid
+        client.configuration.edit_token = cached["trading_token"]
+        client.configuration.edit_sid = cached["trading_sid"]
         return client
 
     # ── Resolve access token (env override or auto-generate via OAuth) ────
@@ -331,6 +334,9 @@ def get_neo_client(force: bool = False):
     client.access_token = trading_token
     client.sid = trading_sid
     client.base_url = base_url
+    # Required for WebSocket subscribe() — SDK checks configuration.edit_token/edit_sid
+    client.configuration.edit_token = trading_token
+    client.configuration.edit_sid = trading_sid
     return client
 
 
