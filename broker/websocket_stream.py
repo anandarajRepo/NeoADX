@@ -61,14 +61,14 @@ class NeoWebSocketStream:
 
     def _subscribe(self) -> None:
         try:
+            self._api.on_message = self._on_message
+            self._api.on_open = self._on_open
+            self._api.on_close = self._on_close
+            self._api.on_error = self._on_error
             self._api.subscribe(
                 instrument_tokens=_NIFTY_TOKEN,
                 isIndex=True,
                 isDepth=False,
-                on_message=self._on_message,
-                on_open=self._on_open,
-                on_close=self._on_close,
-                on_error=self._on_error,
             )
         except Exception as exc:
             logger.error("subscribe() failed: %s", exc)
