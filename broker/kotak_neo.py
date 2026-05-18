@@ -89,7 +89,12 @@ class KotakNeoClient:
             exchange_segment = "nse_fo"
         else:
             trading_symbol = stock_code
-            exchange_segment = "nse_cm" if exchange.upper() == "NSE" else exchange.lower()
+            if exchange.upper() == "NSE":
+                # Indices (NIFTY, BANKNIFTY, …) live on nse_idx; equities on nse_cm.
+                _INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"}
+                exchange_segment = "nse_idx" if stock_code.upper() in _INDEX_SYMBOLS else "nse_cm"
+            else:
+                exchange_segment = exchange.lower()
 
         url = f"{_CHART_BASE_URL}/charts/1.0/chart/history"
         params = {
@@ -154,7 +159,7 @@ class KotakNeoClient:
             resp = self.api.quotes(
                 instrument_tokens=[{
                     "instrument_token": stock_code,
-                    "exchange_segment": "nse_cm",
+                    "exchange_segment": "nse_idx",
                 }],
                 quote_type="ltp",
             )
