@@ -89,15 +89,19 @@ class NeoWebSocketStream:
         self._schedule_reconnect()
 
     def _on_message(self, message) -> None:
+        logger.debug("WebSocket raw message received: %s", message)
         try:
             ticks = message if isinstance(message, list) else [message]
             for tick in ticks:
                 if isinstance(tick, dict):
                     self._process_tick(tick)
+                else:
+                    logger.warning("Unexpected tick format (not dict): %s", type(tick).__name__)
         except Exception as exc:
             logger.error("_on_message processing error: %s", exc)
 
     def _process_tick(self, tick: dict) -> None:
+        logger.debug("Processing tick: %s", tick)
         # Kotak Neo tick fields: lp = last price, ft = feed time (epoch secs)
         ltp_raw = (
             tick.get("lp")
@@ -106,12 +110,15 @@ class NeoWebSocketStream:
             or tick.get("c")
         )
         if ltp_raw is None:
+            logger.warning("Tick missing price field — keys present: %s", list(tick.keys()))
             return
         try:
             ltp = float(ltp_raw)
         except (TypeError, ValueError):
+            logger.warning("Could not convert ltp_raw=%r to float", ltp_raw)
             return
         if ltp <= 0:
+            logger.warning("Tick discarded — non-positive ltp: %s", ltp)
             return
 
         ts_raw = tick.get("ft") or tick.get("ts") or tick.get("timestamp")
@@ -120,6 +127,7 @@ class NeoWebSocketStream:
         except Exception:
             ts = datetime.now(IST)
 
+        logger.info("Tick received — ltp=%.2f  ts=%s", ltp, ts.strftime("%H:%M:%S"))
         self._tick_callback(ltp, ts)
 
     def _schedule_reconnect(self) -> None:
