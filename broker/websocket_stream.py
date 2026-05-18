@@ -39,9 +39,8 @@ class NeoWebSocketStream:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Wire up callbacks and open the WebSocket (non-blocking)."""
+        """Open the WebSocket and subscribe to NIFTY ticks (non-blocking)."""
         self._running = True
-        self._attach_callbacks()
         self._subscribe()
         logger.info("NeoWebSocketStream started — subscribing to NIFTY ticks.")
 
@@ -60,18 +59,16 @@ class NeoWebSocketStream:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _attach_callbacks(self) -> None:
-        self._api.on_message = self._on_message
-        self._api.on_error   = self._on_error
-        self._api.on_close   = self._on_close
-        self._api.on_open    = self._on_open
-
     def _subscribe(self) -> None:
         try:
             self._api.subscribe(
                 instrument_tokens=_NIFTY_TOKEN,
                 isIndex=True,
                 isDepth=False,
+                on_message=self._on_message,
+                on_open=self._on_open,
+                on_close=self._on_close,
+                on_error=self._on_error,
             )
         except Exception as exc:
             logger.error("subscribe() failed: %s", exc)
@@ -140,5 +137,4 @@ class NeoWebSocketStream:
         if not self._running:
             return
         logger.info("Reconnecting WebSocket…")
-        self._attach_callbacks()
         self._subscribe()
