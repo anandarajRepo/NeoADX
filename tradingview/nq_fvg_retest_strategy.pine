@@ -1,5 +1,5 @@
 // ============================================================================
-// NQ Mini Futures — FVG Retest Strategy  v2
+// NQ Mini Futures — FVG Retest Strategy  v3
 // ----------------------------------------------------------------------------
 // Chart     : NQ1! or MNQ1!  |  Timeframe: 1 min
 //
@@ -8,16 +8,25 @@
 //   2. Detect Fair Value Gaps (FVG) on the 1-min chart
 //        Bullish FVG : gap between bar[2] high and current bar low
 //        Bearish FVG : gap between bar[2] low  and current bar high
-//   3. Validate FVG: impulse volume >= avg  |  FVG above/below VWAP
-//                    price above/below 4H close for directional bias
+//   3. Validate FVG:
+//        - Impulse candle volume >= avg volume
+//        - FVG sits above/below VWAP
+//        - Price bias aligns with 4H close
+//        - FVG width <= max_fvg_size (filters out wide FVGs that caused
+//          large losses in v1 — keeps natural FVG-based SL intact)
 //   4. Enter on the RETEST — price returns into the FVG zone
 //   5. Take Profit  : +10 pts from entry
-//      Stop Loss    : FVG-based BUT capped at max_sl_pts from entry
-//                    (v1 had wide FVG SL causing 90pt losses — now capped)
+//      Stop Loss    : FVG bottom - buffer (natural invalidation level)
+//
+// Key fix vs v2:
+//   v2 capped SL at 10 pts regardless of FVG width — this stopped out
+//   trades before price hit the real invalidation level, dropping win
+//   rate from 75% → 48%. v3 instead filters out wide FVGs at detection
+//   so the natural FVG-based SL is never more than ~10 pts from entry.
 // ============================================================================
 
 //@version=5
-strategy("NQ — FVG Retest Strategy v2",
+strategy("NQ — FVG Retest Strategy v3",
      overlay           = true,
      default_qty_type  = strategy.fixed,
      default_qty_value = 1,
@@ -26,15 +35,15 @@ strategy("NQ — FVG Retest Strategy v2",
      slippage          = 1)
 
 // ── Inputs ───────────────────────────────────────────────────────────────────
-vol_period  = input.int(20,   "Volume MA Period",              minval=5,    group="Filters")
+vol_period   = input.int(20,  "Volume MA Period",              minval=5,    group="Filters")
+max_fvg_size = input.float(8, "Max FVG Width (points)",        minval=0.25, step=0.25, group="Filters",
+     tooltip="Skip FVGs wider than this — keeps SL natural but bounded. Wide FVGs caused 90pt losses in v1.")
 
-sess_start  = input.int(930,  "Session Start (HHMM, ET)",      group="Session")
-sess_end    = input.int(1530, "Session End   (HHMM, ET)",      group="Session")
+sess_start   = input.int(930,  "Session Start (HHMM, ET)",     group="Session")
+sess_end     = input.int(1530, "Session End   (HHMM, ET)",     group="Session")
 
-tp_pts      = input.float(10, "Take Profit (points)",  minval=0.25, step=0.25, group="Exits")
-max_sl_pts  = input.float(10, "Max Stop Loss (points)", minval=0.25, step=0.25, group="Exits",
-     tooltip="Hard cap on SL distance from entry. FVG-based SL is used when tighter, this caps wide FVGs.")
-sl_buf      = input.float(2,  "SL buffer beyond FVG (points)", minval=0.25, step=0.25, group="Exits")
+tp_pts       = input.float(10, "Take Profit (points)",  minval=0.25, step=0.25, group="Exits")
+sl_buf       = input.float(2,  "SL buffer beyond FVG (points)", minval=0.25, step=0.25, group="Exits")
 
 // ── Multi-timeframe: last confirmed 4H candle close ──────────────────────────
 h4_close = request.security(syminfo.tickerid, "240", close[1], lookahead=barmerge.lookahead_on)
@@ -49,26 +58,30 @@ in_session = bar_hm >= sess_start and bar_hm < sess_end
 
 // ── FVG Detection (3-candle pattern) ─────────────────────────────────────────
 // Bullish FVG: current bar low > bar[2] high — unfilled gap left by impulse up
-bull_fvg_now = low > high[2]
-bull_fvg_top = low
-bull_fvg_bot = high[2]
+bull_fvg_now  = low > high[2]
+bull_fvg_top  = low
+bull_fvg_bot  = high[2]
+bull_fvg_size = bull_fvg_top - bull_fvg_bot
 
 // Bearish FVG: current bar high < bar[2] low — unfilled gap left by impulse dn
-bear_fvg_now = high < low[2]
-bear_fvg_top = low[2]
-bear_fvg_bot = high
+bear_fvg_now  = high < low[2]
+bear_fvg_top  = low[2]
+bear_fvg_bot  = high
+bear_fvg_size = bear_fvg_top - bear_fvg_bot
 
-// ── Filter: only keep quality FVGs ───────────────────────────────────────────
+// ── Filter: only keep narrow, quality FVGs ───────────────────────────────────
 bull_valid = bull_fvg_now
-     and volume[1] >= avg_vol      // impulse candle had above-avg volume
-     and bull_fvg_bot >= vwap_val  // FVG sits above VWAP
-     and close > h4_close          // bullish bias vs 4H reference
+     and bull_fvg_size <= max_fvg_size   // narrow FVG — SL stays bounded
+     and volume[1]     >= avg_vol        // impulse candle had above-avg volume
+     and bull_fvg_bot  >= vwap_val       // FVG sits above VWAP
+     and close         >  h4_close       // bullish bias vs 4H reference
      and in_session
 
 bear_valid = bear_fvg_now
-     and volume[1] >= avg_vol
-     and bear_fvg_top <= vwap_val  // FVG sits below VWAP
-     and close < h4_close          // bearish bias vs 4H reference
+     and bear_fvg_size <= max_fvg_size
+     and volume[1]     >= avg_vol
+     and bear_fvg_top  <= vwap_val       // FVG sits below VWAP
+     and close         <  h4_close       // bearish bias vs 4H reference
      and in_session
 
 // ── Store the most recent valid FVG ──────────────────────────────────────────
@@ -96,7 +109,7 @@ if bear_valid and no_pos
     s_on  := true
     s_bar := bar_index
 
-// Invalidate if price closes fully through the FVG (mitigation)
+// Invalidate if price closes through the FVG (mitigation)
 if b_on and close < b_bot
     b_on := false
 if s_on and close > s_top
@@ -106,31 +119,25 @@ if s_on and close > s_top
 long_entry  = b_on and no_pos and bar_index > b_bar and low  <= b_top and close >= b_bot
 short_entry = s_on and no_pos and bar_index > s_bar and high >= s_bot and close <= s_top
 
-// ── SL: FVG-based but capped at max_sl_pts from estimated entry ───────────────
-// Estimated entry = current close (market order fills near this on next bar)
-// Use the tighter of: (FVG bottom - buffer) distance OR max_sl_pts
-var int long_sl_ticks  = na
-var int short_sl_ticks = na
+// ── SL: natural FVG-based (safe because wide FVGs are filtered out) ───────────
+var float long_sl  = na
+var float short_sl = na
 
 if long_entry
-    fvg_sl_dist   = close - (b_bot - sl_buf)             // FVG-based distance
-    actual_sl_pts = math.min(fvg_sl_dist, max_sl_pts)    // cap at max
-    long_sl_ticks := math.round(math.max(actual_sl_pts, sl_buf) / syminfo.mintick)
-    b_on := false
+    long_sl  := b_bot - sl_buf
+    b_on     := false
     strategy.entry("Long", strategy.long)
 
 if short_entry
-    fvg_sl_dist    = (s_top + sl_buf) - close
-    actual_sl_pts  = math.min(fvg_sl_dist, max_sl_pts)
-    short_sl_ticks := math.round(math.max(actual_sl_pts, sl_buf) / syminfo.mintick)
-    s_on := false
+    short_sl  := s_top + sl_buf
+    s_on      := false
     strategy.entry("Short", strategy.short)
 
 // ── Exits ─────────────────────────────────────────────────────────────────────
 tp_ticks = math.round(tp_pts / syminfo.mintick)
 
-strategy.exit("XL", "Long",  profit=tp_ticks, loss=long_sl_ticks)
-strategy.exit("XS", "Short", profit=tp_ticks, loss=short_sl_ticks)
+strategy.exit("XL", "Long",  profit=tp_ticks, stop=long_sl)
+strategy.exit("XS", "Short", profit=tp_ticks, stop=short_sl)
 
 // Flatten at session end
 if bar_hm >= sess_end and strategy.position_size != 0
