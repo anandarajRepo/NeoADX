@@ -1,30 +1,37 @@
 // ============================================================================
-// NQ Mini Futures — Liquidity Grab + FVG Retest Strategy
+// NQ Mini Futures — Liquidity Grab + FVG Retest Strategy  v2
 // ----------------------------------------------------------------------------
 // Chart     : NQ1! or MNQ1!  |  Timeframe: 1 min
 //
+// Changes vs v1:
+//   1. Wider 4H grab look-back: sweeps measured against the N-bar swing
+//      high/low (default 5 bars) instead of just the single prior bar —
+//      catches more genuine liquidity grabs
+//   2. Max FVG width raised to 10 pts
+//   3. Full-day trading — no session restriction, all Globex hours
+//
 // Logic:
-//   1. DETECT 4H Liquidity Grab
-//        Bullish grab : prev 4H bar wicked BELOW prior 4H low (swept sell
-//                       stops) then closed BACK ABOVE it → reversal up
-//        Bearish grab : prev 4H bar wicked ABOVE prior 4H high (swept buy
-//                       stops) then closed BACK BELOW it → reversal down
+//   1. DETECT 4H Liquidity Grab (N-bar look-back)
+//        Bullish grab : prev 4H bar wicked BELOW N-bar swing low then
+//                       closed BACK ABOVE it → stops swept, reversal up
+//        Bearish grab : prev 4H bar wicked ABOVE N-bar swing high then
+//                       closed BACK BELOW it → stops swept, reversal down
 //
 //   2. FIND 1-min FVG in the reversal direction
-//        Bullish FVG  : gap above VWAP, impulse volume confirmed, width ≤ max
-//        Bearish FVG  : gap below VWAP, impulse volume confirmed, width ≤ max
+//        - Width ≤ max_fvg_size (bounded SL)
+//        - Impulse candle volume ≥ 20-bar average
+//        - Bullish FVG above VWAP / Bearish FVG below VWAP
 //
-//   3. ENTER on the FVG retest (price returns to FVG zone)
+//   3. ENTER on the FVG retest
 //
 //   4. EXIT
-//        Initial SL   : below FVG bottom (long) / above FVG top (short)
-//        Breakeven trail: once +5 pts in profit, stop moves to entry and
-//                         continues trailing 5 pts behind the high/low
-//                         No fixed TP — let the move run
+//        Initial SL   : FVG bottom – buffer (long) / FVG top + buffer (short)
+//        Trail        : activates after be_pts profit → stop moves to
+//                       breakeven, then trails be_pts behind the high/low
 // ============================================================================
 
 //@version=5
-strategy("NQ — Liquidity Grab + FVG Strategy",
+strategy("NQ — Liquidity Grab + FVG Strategy v2",
      overlay           = true,
      default_qty_type  = strategy.fixed,
      default_qty_value = 1,
@@ -33,38 +40,37 @@ strategy("NQ — Liquidity Grab + FVG Strategy",
      slippage          = 1)
 
 // ── Inputs ───────────────────────────────────────────────────────────────────
-vol_period   = input.int(20,  "Volume MA Period",           minval=5,    group="Filters")
-max_fvg_size = input.float(8, "Max FVG Width (points)",     minval=0.25, step=0.25, group="Filters",
-     tooltip="Skip FVGs wider than this to keep SL bounded.")
+grab_lookback = input.int(5,   "4H Grab Look-back (bars)", minval=2, maxval=20, group="Filters",
+     tooltip="Number of prior 4H bars used to define the swing high/low that gets swept. Higher = more trades.")
+vol_period    = input.int(20,  "Volume MA Period",          minval=5,    group="Filters")
+max_fvg_size  = input.float(10,"Max FVG Width (points)",    minval=0.25, step=0.25, group="Filters")
 
-sess_start   = input.int(930,  "Session Start (HHMM, ET)",  group="Session")
-sess_end     = input.int(1530, "Session End   (HHMM, ET)",  group="Session")
+sl_buf  = input.float(2, "SL buffer beyond FVG (pts)", minval=0.25, step=0.25, group="Exits")
+be_pts  = input.float(5, "Breakeven trail activation (pts)", minval=0.25, step=0.25, group="Exits",
+     tooltip="Once trade is up this many points, stop moves to breakeven and trails be_pts behind the extreme.")
 
-sl_buf       = input.float(2,  "SL buffer beyond FVG (pts)", minval=0.25, step=0.25, group="Exits")
-be_pts       = input.float(5,  "Breakeven trail activation (pts)", minval=0.25, step=0.25, group="Exits",
-     tooltip="Once trade is up this many points, stop moves to breakeven and trails 5pts behind the high/low.")
-
-// ── 4H OHLC (last two completed 4H bars) ────────────────────────────────────
+// ── 4H OHLC (last completed bar) ─────────────────────────────────────────────
 [h4_h1, h4_l1, h4_c1] = request.security(syminfo.tickerid, "240",
      [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
 
-[h4_h2, h4_l2] = request.security(syminfo.tickerid, "240",
-     [high[2], low[2]], lookahead=barmerge.lookahead_on)
+// N-bar swing reference: highest high / lowest low of the grab_lookback bars
+// BEFORE the most recent completed 4H bar (offset [2] excludes bar[1])
+h4_ref_high = request.security(syminfo.tickerid, "240",
+     ta.highest(high, grab_lookback)[2], lookahead=barmerge.lookahead_on)
+
+h4_ref_low  = request.security(syminfo.tickerid, "240",
+     ta.lowest(low,  grab_lookback)[2], lookahead=barmerge.lookahead_on)
 
 // ── 4H Liquidity Grab ────────────────────────────────────────────────────────
-// Bullish: prev 4H wicked below prior 4H low → closed back above it
-bull_grab = h4_l1 < h4_l2 and h4_c1 > h4_l2
+// Bullish: last 4H bar wicked below N-bar swing low → closed back above it
+bull_grab = h4_l1 < h4_ref_low  and h4_c1 > h4_ref_low
 
-// Bearish: prev 4H wicked above prior 4H high → closed back below it
-bear_grab = h4_h1 > h4_h2 and h4_c1 < h4_h2
+// Bearish: last 4H bar wicked above N-bar swing high → closed back below it
+bear_grab = h4_h1 > h4_ref_high and h4_c1 < h4_ref_high
 
 // ── Indicators ───────────────────────────────────────────────────────────────
 vwap_val = ta.vwap(hlc3)
 avg_vol  = ta.sma(volume, vol_period)
-
-// ── Session filter ────────────────────────────────────────────────────────────
-bar_hm     = hour * 100 + minute
-in_session = bar_hm >= sess_start and bar_hm < sess_end
 
 // ── 1-min FVG Detection ───────────────────────────────────────────────────────
 bull_fvg_now  = low > high[2]
@@ -77,20 +83,18 @@ bear_fvg_top  = low[2]
 bear_fvg_bot  = high
 bear_fvg_size = bear_fvg_top - bear_fvg_bot
 
-// ── Validate FVG: must align with 4H grab + VWAP + volume ────────────────────
+// ── Validate FVG ─────────────────────────────────────────────────────────────
 bull_valid = bull_fvg_now
-     and bull_grab                      // 4H bullish liquidity grab active
-     and bull_fvg_size <= max_fvg_size  // narrow FVG — SL stays bounded
-     and volume[1]     >= avg_vol       // impulse candle volume confirmed
-     and bull_fvg_bot  >= vwap_val      // FVG above VWAP
-     and in_session
+     and bull_grab
+     and bull_fvg_size <= max_fvg_size
+     and volume[1]    >= avg_vol
+     and bull_fvg_bot >= vwap_val
 
 bear_valid = bear_fvg_now
      and bear_grab
      and bear_fvg_size <= max_fvg_size
-     and volume[1]     >= avg_vol
-     and bear_fvg_top  <= vwap_val      // FVG below VWAP
-     and in_session
+     and volume[1]    >= avg_vol
+     and bear_fvg_top <= vwap_val
 
 // ── Store most recent valid FVG ───────────────────────────────────────────────
 var float b_top = na
@@ -140,30 +144,22 @@ if short_entry
     s_on      := false
     strategy.entry("Short", strategy.short)
 
-// ── Exit: FVG-based initial SL + breakeven trail after be_pts ────────────────
-// trail_points = activation: once price moves be_pts in profit
-// trail_offset = trail distance: stop trails be_pts behind the extreme
-// At the moment of activation: stop = entry (breakeven), then follows price
+// ── Exit: FVG initial SL + breakeven trail after be_pts ──────────────────────
+// At activation (+be_pts from entry): stop = entry (breakeven)
+// After activation: stop trails be_pts behind the high/low
 be_ticks = math.round(be_pts / syminfo.mintick)
 
 strategy.exit("XL", "Long",  stop=long_sl,  trail_points=be_ticks, trail_offset=be_ticks)
 strategy.exit("XS", "Short", stop=short_sl, trail_points=be_ticks, trail_offset=be_ticks)
 
-// Flatten at session end
-if bar_hm >= sess_end and strategy.position_size != 0
-    strategy.close_all(comment="Session End")
-
 // ── Visuals ──────────────────────────────────────────────────────────────────
-// 4H reference: previous completed 4H bar's high and low
-plot(h4_h1, "4H High", color=color.new(color.red,   40), linewidth=1, style=plot.style_stepline)
-plot(h4_l1, "4H Low",  color=color.new(color.green, 40), linewidth=1, style=plot.style_stepline)
-plot(vwap_val, "VWAP", color=color.blue, linewidth=2)
+plot(h4_ref_high, "4H Swing High", color=color.new(color.red,   40), linewidth=1, style=plot.style_stepline)
+plot(h4_ref_low,  "4H Swing Low",  color=color.new(color.green, 40), linewidth=1, style=plot.style_stepline)
+plot(vwap_val,    "VWAP",          color=color.blue, linewidth=2)
 
-// Background highlight when a grab is active
-bgcolor(bull_grab and in_session ? color.new(color.green, 93) : na, title="Bullish Grab Window")
-bgcolor(bear_grab and in_session ? color.new(color.red,   93) : na, title="Bearish Grab Window")
+bgcolor(bull_grab ? color.new(color.green, 93) : na, title="Bullish Grab Window")
+bgcolor(bear_grab ? color.new(color.red,   93) : na, title="Bearish Grab Window")
 
-// FVG boxes
 if bull_valid
     box.new(bar_index[2], bull_fvg_top, bar_index + 30, bull_fvg_bot,
          border_color=color.new(color.green, 20),
@@ -174,7 +170,6 @@ if bear_valid
          border_color=color.new(color.red, 20),
          bgcolor=color.new(color.red, 80), border_width=1)
 
-// Entry signals
 plotshape(long_entry,
      style=shape.triangleup, location=location.belowbar,
      color=color.lime, size=size.normal, title="Long Entry")
