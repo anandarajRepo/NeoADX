@@ -1,14 +1,18 @@
 // ============================================================================
-// NQ Mini Futures — 4H VWAP Strategy
+// NQ Mini Futures — 4H VWAP Strategy  v2
 // ----------------------------------------------------------------------------
 // Chart  : NQ1! or MNQ1!  |  Timeframe: 4H
-// Entry  : At open of each 4H candle when prev candle closes above/below VWAP
-//          AND prev candle volume >= 20-bar average volume
-// Exit   : +10 pts take profit  |  5 pt trailing stop  |  End-of-bar close
+//
+// Fixes vs v1:
+//   1. Hard stop loss added — protects against immediate adverse moves before
+//      the trailing stop has a chance to activate
+//   2. EMA trend filter — only long above EMA, only short below EMA
+//   3. Session filter — skip overnight candles (trade NY session only)
+//   4. Volume threshold raised to 1.5× average for higher-conviction entries
 // ============================================================================
 
 //@version=5
-strategy("NQ 4H VWAP Strategy",
+strategy("NQ 4H VWAP Strategy v2",
      overlay           = true,
      default_qty_type  = strategy.fixed,
      default_qty_value = 1,
@@ -17,39 +21,58 @@ strategy("NQ 4H VWAP Strategy",
      slippage          = 2)
 
 // ── Inputs ───────────────────────────────────────────────────────────────────
-vol_period = input.int(20,   "Volume MA Period",     minval=5,    group="Filters")
-tp_pts     = input.float(10, "Take Profit (points)", minval=0.25, step=0.25, group="Exits")
-trail_pts  = input.float(5,  "Trail Stop (points)",  minval=0.25, step=0.25, group="Exits")
+// Filters
+ema_period  = input.int(50,   "EMA Period (trend filter)",  minval=10,   group="Filters")
+vol_period  = input.int(20,   "Volume MA Period",           minval=5,    group="Filters")
+vol_mult    = input.float(1.5,"Volume Multiplier (×avg)",   minval=1.0, step=0.1, group="Filters")
+
+// Session (Exchange time — ET for NQ on CME)
+sess_start  = input.int(800,  "Session Start (HHMM, ET)",  group="Session Filter")
+sess_end    = input.int(1530, "Session End   (HHMM, ET)",  group="Session Filter")
+
+// Exits
+tp_pts      = input.float(10, "Take Profit (points)",   minval=0.25, step=0.25, group="Exits")
+sl_pts      = input.float(15, "Hard Stop Loss (points)",minval=0.25, step=0.25, group="Exits")
+trail_pts   = input.float(5,  "Trail Activation (points after entry)", minval=0.25, step=0.25, group="Exits")
 
 // ── Indicators ───────────────────────────────────────────────────────────────
 vwap_val = ta.vwap(hlc3)
+ema_val  = ta.ema(close, ema_period)
 avg_vol  = ta.sma(volume, vol_period)
+
+// ── Session filter ────────────────────────────────────────────────────────────
+bar_hour_min = hour * 100 + minute
+in_session   = bar_hour_min >= sess_start and bar_hour_min < sess_end
 
 // ── Signals (evaluated at bar close → entry fires at NEXT bar open) ──────────
 no_pos       = strategy.position_size == 0
-vol_ok       = volume >= avg_vol
+vol_ok       = volume >= avg_vol * vol_mult
+trend_up     = close > ema_val
+trend_dn     = close < ema_val
 
-long_signal  = no_pos and vol_ok and close > vwap_val
-short_signal = no_pos and vol_ok and close < vwap_val
+long_signal  = no_pos and in_session and vol_ok and trend_up and close > vwap_val
+short_signal = no_pos and in_session and vol_ok and trend_dn and close < vwap_val
 
 // ── Entries ──────────────────────────────────────────────────────────────────
 strategy.entry("Long",  strategy.long,  when=long_signal)
 strategy.entry("Short", strategy.short, when=short_signal)
 
-// ── Exits: Take Profit + Trailing Stop ───────────────────────────────────────
-// trail_points activates after price moves trail_pts in our favour,
-// then trails 5 pts below the highest price reached (long) or above lowest (short)
-tp_ticks    = math.round(tp_pts   / syminfo.mintick)
+// ── Exits: Hard SL + TP + Trail ──────────────────────────────────────────────
+// Hard SL fires immediately if price moves against entry (no gap exposure)
+// Trail activates after trail_pts of profit, then trails that same distance
+tp_ticks    = math.round(tp_pts    / syminfo.mintick)
+sl_ticks    = math.round(sl_pts    / syminfo.mintick)
 trail_ticks = math.round(trail_pts / syminfo.mintick)
 
-strategy.exit("XL", "Long",  profit=tp_ticks, trail_points=trail_ticks)
-strategy.exit("XS", "Short", profit=tp_ticks, trail_points=trail_ticks)
+strategy.exit("XL", "Long",  profit=tp_ticks, loss=sl_ticks, trail_points=trail_ticks)
+strategy.exit("XS", "Short", profit=tp_ticks, loss=sl_ticks, trail_points=trail_ticks)
 
-// ── Time Exit: flatten at end of entry bar ───────────────────────────────────
+// ── Time Exit: flatten at end of bar ─────────────────────────────────────────
 strategy.close_all(when=barstate.isconfirmed, comment="EOB")
 
 // ── Visuals ──────────────────────────────────────────────────────────────────
-plot(vwap_val, "VWAP", color=color.blue, linewidth=2)
+plot(vwap_val, "VWAP", color=color.blue,  linewidth=2)
+plot(ema_val,  "EMA",  color=color.orange, linewidth=1)
 
 plotshape(long_signal,
      style    = shape.triangleup,
@@ -65,5 +88,4 @@ plotshape(short_signal,
      size     = size.small,
      title    = "Short Signal")
 
-// Highlight bars with above-average volume
 barcolor(vol_ok ? color.new(color.orange, 75) : na, title="High Volume Bar")
