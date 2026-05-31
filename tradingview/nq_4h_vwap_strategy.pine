@@ -68,7 +68,8 @@ strategy.exit("XL", "Long",  profit=tp_ticks, loss=sl_ticks, trail_points=trail_
 strategy.exit("XS", "Short", profit=tp_ticks, loss=sl_ticks, trail_points=trail_ticks)
 
 // ── Time Exit: flatten at end of bar ─────────────────────────────────────────
-strategy.close_all(when=barstate.isconfirmed, comment="EOB")
+if barstate.isconfirmed
+    strategy.close_all(comment="EOB")
 
 // ── Visuals ──────────────────────────────────────────────────────────────────
 plot(vwap_val, "VWAP", color=color.blue,  linewidth=2)
