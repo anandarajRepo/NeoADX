@@ -1,0 +1,170 @@
+// ============================================================================
+// NQ Mini Futures — 1H Liquidity Grab + FVG Retest Strategy
+// ----------------------------------------------------------------------------
+// Chart     : NQ1! or MNQ1!  |  Timeframe: 1 min
+//
+// Same logic as the 4H version — only the reference timeframe changes:
+//   1. DETECT 1H Liquidity Grab (N-bar look-back)
+//        Bullish grab : prev 1H bar wicked BELOW N-bar swing low then
+//                       closed BACK ABOVE it → stops swept, reversal up
+//        Bearish grab : prev 1H bar wicked ABOVE N-bar swing high then
+//                       closed BACK BELOW it → stops swept, reversal down
+//
+//   2. FIND 1-min FVG in the reversal direction
+//        - Width ≤ max_fvg_size (bounded SL)
+//        - Impulse candle volume ≥ 20-bar average
+//        - Bullish FVG above VWAP / Bearish FVG below VWAP
+//
+//   3. ENTER on the FVG retest
+//
+//   4. EXIT
+//        Initial SL   : FVG bottom – buffer (long) / FVG top + buffer (short)
+//        Trail        : activates after be_pts profit → stop moves to
+//                       breakeven, then trails be_pts behind the high/low
+// ============================================================================
+
+//@version=5
+strategy("NQ — 1H Liquidity Grab + FVG Strategy",
+     overlay           = true,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     commission_type   = strategy.commission.cash_per_contract,
+     commission_value  = 2.0,
+     slippage          = 1)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grab_lookback = input.int(5,   "1H Grab Look-back (bars)", minval=2, maxval=20, group="Filters",
+     tooltip="Number of prior 1H bars used to define the swing high/low that gets swept. Higher = more trades.")
+vol_period    = input.int(20,  "Volume MA Period",          minval=5,    group="Filters")
+max_fvg_size  = input.float(10,"Max FVG Width (points)",    minval=0.25, step=0.25, group="Filters")
+
+sl_buf  = input.float(2, "SL buffer beyond FVG (pts)",          minval=0.25, step=0.25, group="Exits")
+be_pts  = input.float(5, "Breakeven trail activation (pts)",     minval=0.25, step=0.25, group="Exits",
+     tooltip="Once trade is up this many points, stop moves to breakeven and trails be_pts behind the extreme.")
+
+// ── 1H OHLC (last completed bar) ─────────────────────────────────────────────
+[h1_h1, h1_l1, h1_c1] = request.security(syminfo.tickerid, "60",
+     [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+
+// N-bar swing reference: highest high / lowest low of the grab_lookback bars
+// BEFORE the most recent completed 1H bar (offset [2] excludes bar[1])
+h1_ref_high = request.security(syminfo.tickerid, "60",
+     ta.highest(high, grab_lookback)[2], lookahead=barmerge.lookahead_on)
+
+h1_ref_low  = request.security(syminfo.tickerid, "60",
+     ta.lowest(low,  grab_lookback)[2], lookahead=barmerge.lookahead_on)
+
+// ── 1H Liquidity Grab ────────────────────────────────────────────────────────
+// Bullish: last 1H bar wicked below N-bar swing low → closed back above it
+bull_grab = h1_l1 < h1_ref_low  and h1_c1 > h1_ref_low
+
+// Bearish: last 1H bar wicked above N-bar swing high → closed back below it
+bear_grab = h1_h1 > h1_ref_high and h1_c1 < h1_ref_high
+
+// ── Indicators ───────────────────────────────────────────────────────────────
+vwap_val = ta.vwap(hlc3)
+avg_vol  = ta.sma(volume, vol_period)
+
+// ── 1-min FVG Detection ───────────────────────────────────────────────────────
+bull_fvg_now  = low > high[2]
+bull_fvg_top  = low
+bull_fvg_bot  = high[2]
+bull_fvg_size = bull_fvg_top - bull_fvg_bot
+
+bear_fvg_now  = high < low[2]
+bear_fvg_top  = low[2]
+bear_fvg_bot  = high
+bear_fvg_size = bear_fvg_top - bear_fvg_bot
+
+// ── Validate FVG ─────────────────────────────────────────────────────────────
+bull_valid = bull_fvg_now
+     and bull_grab
+     and bull_fvg_size <= max_fvg_size
+     and volume[1]    >= avg_vol
+     and bull_fvg_bot >= vwap_val
+
+bear_valid = bear_fvg_now
+     and bear_grab
+     and bear_fvg_size <= max_fvg_size
+     and volume[1]    >= avg_vol
+     and bear_fvg_top <= vwap_val
+
+// ── Store most recent valid FVG ───────────────────────────────────────────────
+var float b_top = na
+var float b_bot = na
+var bool  b_on  = false
+var int   b_bar = na
+
+var float s_top = na
+var float s_bot = na
+var bool  s_on  = false
+var int   s_bar = na
+
+no_pos = strategy.position_size == 0
+
+if bull_valid and no_pos
+    b_top := bull_fvg_top
+    b_bot := bull_fvg_bot
+    b_on  := true
+    b_bar := bar_index
+
+if bear_valid and no_pos
+    s_top := bear_fvg_top
+    s_bot := bear_fvg_bot
+    s_on  := true
+    s_bar := bar_index
+
+// Invalidate if price closes through the FVG (mitigated)
+if b_on and close < b_bot
+    b_on := false
+if s_on and close > s_top
+    s_on := false
+
+// ── Entry: retest of FVG zone ─────────────────────────────────────────────────
+long_entry  = b_on and no_pos and bar_index > b_bar and low  <= b_top and close >= b_bot
+short_entry = s_on and no_pos and bar_index > s_bar and high >= s_bot and close <= s_top
+
+var float long_sl  = na
+var float short_sl = na
+
+if long_entry
+    long_sl  := b_bot - sl_buf
+    b_on     := false
+    strategy.entry("Long", strategy.long)
+
+if short_entry
+    short_sl  := s_top + sl_buf
+    s_on      := false
+    strategy.entry("Short", strategy.short)
+
+// ── Exit: FVG initial SL + breakeven trail after be_pts ──────────────────────
+be_ticks = math.round(be_pts / syminfo.mintick)
+
+strategy.exit("XL", "Long",  stop=long_sl,  trail_points=be_ticks, trail_offset=be_ticks)
+strategy.exit("XS", "Short", stop=short_sl, trail_points=be_ticks, trail_offset=be_ticks)
+
+// ── Visuals ──────────────────────────────────────────────────────────────────
+plot(h1_ref_high, "1H Swing High", color=color.new(color.red,   40), linewidth=1, style=plot.style_stepline)
+plot(h1_ref_low,  "1H Swing Low",  color=color.new(color.green, 40), linewidth=1, style=plot.style_stepline)
+plot(vwap_val,    "VWAP",          color=color.blue, linewidth=2)
+
+bgcolor(bull_grab ? color.new(color.green, 93) : na, title="Bullish Grab Window")
+bgcolor(bear_grab ? color.new(color.red,   93) : na, title="Bearish Grab Window")
+
+if bull_valid
+    box.new(bar_index[2], bull_fvg_top, bar_index + 30, bull_fvg_bot,
+         border_color=color.new(color.green, 20),
+         bgcolor=color.new(color.green, 80), border_width=1)
+
+if bear_valid
+    box.new(bar_index[2], bear_fvg_top, bar_index + 30, bear_fvg_bot,
+         border_color=color.new(color.red, 20),
+         bgcolor=color.new(color.red, 80), border_width=1)
+
+plotshape(long_entry,
+     style=shape.triangleup, location=location.belowbar,
+     color=color.lime, size=size.normal, title="Long Entry")
+
+plotshape(short_entry,
+     style=shape.triangledown, location=location.abovebar,
+     color=color.red, size=size.normal, title="Short Entry")
