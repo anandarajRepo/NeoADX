@@ -1,18 +1,20 @@
 // ============================================================================
-// NQ Mini Futures — 4H VWAP Strategy  v2
+// NQ Mini Futures — 4H VWAP Strategy  v3
 // ----------------------------------------------------------------------------
 // Chart  : NQ1! or MNQ1!  |  Timeframe: 4H
 //
-// Fixes vs v1:
-//   1. Hard stop loss added — protects against immediate adverse moves before
-//      the trailing stop has a chance to activate
-//   2. EMA trend filter — only long above EMA, only short below EMA
-//   3. Session filter — skip overnight candles (trade NY session only)
-//   4. Volume threshold raised to 1.5× average for higher-conviction entries
+// Changes vs v2:
+//   1. TP raised 10 → 25 pts  — fixes the inverted R:R (was 0.67:1, now 1.67:1)
+//      At 40% win rate you need ≥1.5:1 R:R to break even; v2 was mathematically
+//      guaranteed to lose at any win rate below 60%.
+//   2. EOB time exit removed  — letting TP/SL manage the trade instead of
+//      force-closing at bar close, which was killing trades en route to target.
+//   3. RSI filter added       — only long when RSI > 50, short when RSI < 50,
+//      confirming momentum aligns with the VWAP direction signal.
 // ============================================================================
 
 //@version=5
-strategy("NQ 4H VWAP Strategy v2",
+strategy("NQ 4H VWAP Strategy v3",
      overlay           = true,
      default_qty_type  = strategy.fixed,
      default_qty_value = 1,
@@ -22,22 +24,24 @@ strategy("NQ 4H VWAP Strategy v2",
 
 // ── Inputs ───────────────────────────────────────────────────────────────────
 // Filters
-ema_period  = input.int(50,   "EMA Period (trend filter)",  minval=10,   group="Filters")
-vol_period  = input.int(20,   "Volume MA Period",           minval=5,    group="Filters")
-vol_mult    = input.float(1.5,"Volume Multiplier (×avg)",   minval=1.0, step=0.1, group="Filters")
+ema_period  = input.int(50,   "EMA Period (trend filter)", minval=10,  group="Filters")
+rsi_period  = input.int(14,   "RSI Period",                minval=5,   group="Filters")
+vol_period  = input.int(20,   "Volume MA Period",          minval=5,   group="Filters")
+vol_mult    = input.float(1.5,"Volume Multiplier (×avg)",  minval=1.0, step=0.1, group="Filters")
 
 // Session (Exchange time — ET for NQ on CME)
-sess_start  = input.int(800,  "Session Start (HHMM, ET)",  group="Session Filter")
-sess_end    = input.int(1530, "Session End   (HHMM, ET)",  group="Session Filter")
+sess_start  = input.int(800,  "Session Start (HHMM, ET)", group="Session Filter")
+sess_end    = input.int(1530, "Session End   (HHMM, ET)", group="Session Filter")
 
 // Exits
-tp_pts      = input.float(10, "Take Profit (points)",   minval=0.25, step=0.25, group="Exits")
-sl_pts      = input.float(15, "Hard Stop Loss (points)",minval=0.25, step=0.25, group="Exits")
-trail_pts   = input.float(5,  "Trail Activation (points after entry)", minval=0.25, step=0.25, group="Exits")
+tp_pts      = input.float(25, "Take Profit (points)",    minval=1.0, step=0.25, group="Exits")
+sl_pts      = input.float(15, "Hard Stop Loss (points)", minval=1.0, step=0.25, group="Exits")
+trail_pts   = input.float(5,  "Trail Activation (pts)",  minval=0.25,step=0.25, group="Exits")
 
 // ── Indicators ───────────────────────────────────────────────────────────────
 vwap_val = ta.vwap(hlc3)
 ema_val  = ta.ema(close, ema_period)
+rsi_val  = ta.rsi(close, rsi_period)
 avg_vol  = ta.sma(volume, vol_period)
 
 // ── Session filter ────────────────────────────────────────────────────────────
@@ -49,17 +53,19 @@ no_pos       = strategy.position_size == 0
 vol_ok       = volume >= avg_vol * vol_mult
 trend_up     = close > ema_val
 trend_dn     = close < ema_val
+rsi_bull     = rsi_val > 50
+rsi_bear     = rsi_val < 50
 
-long_signal  = no_pos and in_session and vol_ok and trend_up and close > vwap_val
-short_signal = no_pos and in_session and vol_ok and trend_dn and close < vwap_val
+long_signal  = no_pos and in_session and vol_ok and trend_up and rsi_bull and close > vwap_val
+short_signal = no_pos and in_session and vol_ok and trend_dn and rsi_bear and close < vwap_val
 
 // ── Entries ──────────────────────────────────────────────────────────────────
 strategy.entry("Long",  strategy.long,  when=long_signal)
 strategy.entry("Short", strategy.short, when=short_signal)
 
 // ── Exits: Hard SL + TP + Trail ──────────────────────────────────────────────
-// Hard SL fires immediately if price moves against entry (no gap exposure)
-// Trail activates after trail_pts of profit, then trails that same distance
+// R:R = 25:15 = 1.67:1  →  breaks even at 37.5% win rate
+// Trail activates after trail_pts profit, then trails that distance from peak
 tp_ticks    = math.round(tp_pts    / syminfo.mintick)
 sl_ticks    = math.round(sl_pts    / syminfo.mintick)
 trail_ticks = math.round(trail_pts / syminfo.mintick)
@@ -67,12 +73,8 @@ trail_ticks = math.round(trail_pts / syminfo.mintick)
 strategy.exit("XL", "Long",  profit=tp_ticks, loss=sl_ticks, trail_points=trail_ticks)
 strategy.exit("XS", "Short", profit=tp_ticks, loss=sl_ticks, trail_points=trail_ticks)
 
-// ── Time Exit: flatten at end of bar ─────────────────────────────────────────
-if barstate.isconfirmed
-    strategy.close_all(comment="EOB")
-
 // ── Visuals ──────────────────────────────────────────────────────────────────
-plot(vwap_val, "VWAP", color=color.blue,  linewidth=2)
+plot(vwap_val, "VWAP", color=color.blue,   linewidth=2)
 plot(ema_val,  "EMA",  color=color.orange, linewidth=1)
 
 plotshape(long_signal,
@@ -90,3 +92,7 @@ plotshape(short_signal,
      title    = "Short Signal")
 
 barcolor(vol_ok ? color.new(color.orange, 75) : na, title="High Volume Bar")
+
+// RSI panel
+hline(50, "RSI Mid", color=color.gray, linestyle=hline.style_dashed)
+plot(rsi_val, "RSI", color=color.purple, display=display.pane)
