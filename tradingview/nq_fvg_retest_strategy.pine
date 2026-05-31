@@ -1,0 +1,170 @@
+// ============================================================================
+// NQ Mini Futures — FVG Retest Strategy
+// ----------------------------------------------------------------------------
+// Chart     : NQ1! or MNQ1!  |  Timeframe: 1 min
+//
+// Logic:
+//   1. Mark the last confirmed 4H candle close as the directional reference
+//   2. Detect Fair Value Gaps (FVG) on the 1-min chart
+//        Bullish FVG : gap between bar[2] high and current bar low (impulse up)
+//        Bearish FVG : gap between bar[2] low  and current bar high (impulse dn)
+//   3. Validate FVG with:
+//        - Impulse candle volume >= average volume
+//        - Bullish FVG sits above VWAP / Bearish FVG sits below VWAP
+//        - Price is above 4H close for longs / below 4H close for shorts
+//   4. Enter on the RETEST — price returns into the FVG zone
+//   5. Take Profit  : +10 pts from entry
+//      Stop Loss    : below FVG bottom (long) / above FVG top (short)
+// ============================================================================
+
+//@version=5
+strategy("NQ — FVG Retest Strategy",
+     overlay           = true,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     commission_type   = strategy.commission.cash_per_contract,
+     commission_value  = 2.0,
+     slippage          = 1)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+vol_period = input.int(20,  "Volume MA Period",                minval=5,    group="Filters")
+
+sess_start = input.int(930, "Session Start (HHMM, ET)",        group="Session")
+sess_end   = input.int(1530,"Session End   (HHMM, ET)",        group="Session")
+
+tp_pts  = input.float(10,   "Take Profit (points)",   minval=0.25, step=0.25, group="Exits")
+sl_buf  = input.float(2,    "SL buffer beyond FVG (points)", minval=0.25, step=0.25, group="Exits")
+
+// ── Multi-timeframe: last confirmed 4H candle close ──────────────────────────
+h4_close = request.security(syminfo.tickerid, "240", close[1], lookahead=barmerge.lookahead_on)
+
+// ── Indicators ───────────────────────────────────────────────────────────────
+vwap_val = ta.vwap(hlc3)
+avg_vol  = ta.sma(volume, vol_period)
+
+// ── Session filter ────────────────────────────────────────────────────────────
+bar_hm     = hour * 100 + minute
+in_session = bar_hm >= sess_start and bar_hm < sess_end
+
+// ── FVG Detection (3-candle pattern) ─────────────────────────────────────────
+// Bullish FVG: current candle's low is above bar[2]'s high → unfilled gap
+bull_fvg_now = low > high[2]
+bull_fvg_top = low           // upper edge of the gap  (candle 3 low)
+bull_fvg_bot = high[2]       // lower edge of the gap  (candle 1 high)
+
+// Bearish FVG: current candle's high is below bar[2]'s low → unfilled gap
+bear_fvg_now = high < low[2]
+bear_fvg_top = low[2]        // upper edge of the gap  (candle 1 low)
+bear_fvg_bot = high          // lower edge of the gap  (candle 3 high)
+
+// ── Filter: only keep FVGs that meet all conditions ──────────────────────────
+bull_valid = bull_fvg_now
+     and volume[1] >= avg_vol   // impulse candle had above-avg volume
+     and bull_fvg_bot >= vwap_val // entire FVG sits above VWAP
+     and close > h4_close        // price above 4H close → bullish bias
+     and in_session
+
+bear_valid = bear_fvg_now
+     and volume[1] >= avg_vol
+     and bear_fvg_top <= vwap_val // entire FVG sits below VWAP
+     and close < h4_close         // price below 4H close → bearish bias
+     and in_session
+
+// ── Store the most recent valid FVG ──────────────────────────────────────────
+var float b_top  = na
+var float b_bot  = na
+var bool  b_on   = false
+var int   b_bar  = na
+
+var float s_top  = na
+var float s_bot  = na
+var bool  s_on   = false
+var int   s_bar  = na
+
+no_pos = strategy.position_size == 0
+
+// Register new FVG (replaces any prior unretested one)
+if bull_valid and no_pos
+    b_top := bull_fvg_top
+    b_bot := bull_fvg_bot
+    b_on  := true
+    b_bar := bar_index
+
+if bear_valid and no_pos
+    s_top := bear_fvg_top
+    s_bot := bear_fvg_bot
+    s_on  := true
+    s_bar := bar_index
+
+// Invalidate (mitigate) if price closes fully through the FVG
+if b_on and close < b_bot
+    b_on := false
+
+if s_on and close > s_top
+    s_on := false
+
+// ── Entry: retest of FVG zone ────────────────────────────────────────────────
+// Long  : price dips into the bullish FVG but candle closes inside or above it
+// Short : price pops into the bearish FVG but candle closes inside or below it
+long_entry  = b_on and no_pos and bar_index > b_bar and low  <= b_top and close >= b_bot
+short_entry = s_on and no_pos and bar_index > s_bar and high >= s_bot and close <= s_top
+
+// Capture FVG-based stop levels at entry
+var float long_sl  = na
+var float short_sl = na
+
+if long_entry
+    long_sl  := b_bot - sl_buf
+    b_on     := false
+    strategy.entry("Long", strategy.long)
+
+if short_entry
+    short_sl  := s_top + sl_buf
+    s_on      := false
+    strategy.entry("Short", strategy.short)
+
+// ── Exits ─────────────────────────────────────────────────────────────────────
+tp_ticks = math.round(tp_pts / syminfo.mintick)
+
+// TP in ticks, SL as absolute price (FVG-derived)
+strategy.exit("XL", "Long",  profit=tp_ticks, stop=long_sl)
+strategy.exit("XS", "Short", profit=tp_ticks, stop=short_sl)
+
+// Flatten at session end
+if bar_hm >= sess_end and strategy.position_size != 0
+    strategy.close_all(comment="Session End")
+
+// ── Visuals ──────────────────────────────────────────────────────────────────
+// 4H close reference (yellow step line)
+plot(h4_close, "4H Close", color=color.yellow, linewidth=1, style=plot.style_stepline)
+
+// VWAP
+plot(vwap_val, "VWAP", color=color.blue, linewidth=2)
+
+// FVG boxes
+if bull_valid
+    box.new(bar_index[2], bull_fvg_top, bar_index + 30, bull_fvg_bot,
+         border_color = color.new(color.green, 30),
+         bgcolor      = color.new(color.green, 85),
+         border_width = 1)
+
+if bear_valid
+    box.new(bar_index[2], bear_fvg_top, bar_index + 30, bear_fvg_bot,
+         border_color = color.new(color.red, 30),
+         bgcolor      = color.new(color.red, 85),
+         border_width = 1)
+
+// Entry arrows
+plotshape(long_entry,
+     style    = shape.triangleup,
+     location = location.belowbar,
+     color    = color.green,
+     size     = size.normal,
+     title    = "Long Entry")
+
+plotshape(short_entry,
+     style    = shape.triangledown,
+     location = location.abovebar,
+     color    = color.red,
+     size     = size.normal,
+     title    = "Short Entry")
