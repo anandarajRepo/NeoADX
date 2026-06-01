@@ -1,0 +1,695 @@
+// =============================================================================
+// IBL + SuperDOM + FVG Strategy — MNQ Signal Engine
+// Author  : Built for AJ
+// Version : Pine Script v6
+// =============================================================================
+
+//@version=6
+indicator("IBL + SuperDOM + FVG", "IBL+FVG", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=100)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+var string GRP_IB  = "Initial Balance"
+var string GRP_FVG = "Fair Value Gap"
+var string GRP_DOM = "DOM Settings"
+var string GRP_SIG = "Signal Engine"
+var string GRP_VIZ = "Visualisation"
+
+hi_color     = input.color(color.new(color.green,  50), "IB High Color",    group=GRP_IB)
+lo_color     = input.color(color.new(color.red,    50), "IB Low Color",     group=GRP_IB)
+mid_color    = input.color(color.new(color.orange, 50), "IB Mid Color",     group=GRP_IB)
+line_width   = input.int(1,     "Line Width",               minval=1, maxval=4,    group=GRP_IB)
+extend_lines = input.bool(true,  "Extend Lines to Right",                          group=GRP_IB)
+show_days    = input.int(5,     "Days to Show",             minval=1, maxval=30,   group=GRP_IB)
+show_labels  = input.bool(true,  "Show Price Labels",                              group=GRP_IB)
+ib_proximity = input.float(0.15, "IB Proximity %",          minval=0.05, step=0.05, group=GRP_IB)
+
+bool  i_showFVG    = input.bool(true,   "Show FVG Zones",            group=GRP_FVG)
+color i_bullFVGCol = input.color(color.new(color.green, 80), "Bull FVG Color", group=GRP_FVG)
+color i_bearFVGCol = input.color(color.new(color.red,   80), "Bear FVG Color", group=GRP_FVG)
+float i_maxStop    = input.float(10.0,  "Max Stop Loss (points)",    minval=1.0, step=0.5, group=GRP_FVG)
+int   i_maxFVGs    = input.int(5,       "Max Active FVGs",           minval=1, maxval=10,  group=GRP_FVG)
+
+int   i_lookback    = input.int(20,    "Lookback Bars",              minval=5, maxval=100, group=GRP_DOM)
+int   i_levels      = input.int(10,    "Price Levels",               minval=5, maxval=20,  group=GRP_DOM)
+float i_ticksize    = input.float(0.25, "Tick Size (MNQ=0.25)",      minval=0.01, step=0.25, group=GRP_DOM)
+float i_imbPct      = input.float(65.0, "Imbalance Threshold %",     minval=51, maxval=99,   group=GRP_DOM)
+float i_imbMinVol   = input.float(50.0, "Min Volume for Imbalance",  minval=0,               group=GRP_DOM)
+
+int   i_minScore    = input.int(3,     "Min Score (1-5)",            minval=1, maxval=5,   group=GRP_SIG)
+int   i_stackN      = input.int(3,     "Stacked Imbalance Bars",     minval=2, maxval=8,   group=GRP_SIG)
+float i_absorbMult  = input.float(1.5, "Absorption Vol Multiplier",  minval=1.1, step=0.1, group=GRP_SIG)
+int   i_absorbTicks = input.int(3,     "Absorption Max Ticks",       minval=1, maxval=10,  group=GRP_SIG)
+int   i_divLen      = input.int(5,     "Delta Divergence Lookback",  minval=2, maxval=20,  group=GRP_SIG)
+int   i_momLen      = input.int(5,     "Delta Momentum Length",      minval=2, maxval=20,  group=GRP_SIG)
+bool   i_sesFilter  = input.bool(true,               "RTH Filter",   group=GRP_SIG)
+string i_session    = input.string("0930-1600",       "Session",      group=GRP_SIG)
+string i_tz         = input.string("America/New_York","Timezone",     group=GRP_SIG)
+
+bool  i_showSigs = input.bool(true,  "Show Entry Labels", group=GRP_VIZ)
+bool  i_showPOC  = input.bool(true,  "Show POC Line",     group=GRP_VIZ)
+color i_colPOC   = input.color(color.new(#FFD600, 50), "POC Colour",  group=GRP_VIZ)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+scoreLabel(int sc) =>
+    string r = "-----"
+    if sc == 5
+        r := "AAAAA"
+    else if sc == 4
+        r := "AAAA-"
+    else if sc == 3
+        r := "AAA--"
+    else if sc == 2
+        r := "AA---"
+    else if sc == 1
+        r := "A----"
+    r
+
+fmtP(float p) =>
+    str.tostring(math.round(p, 2))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION
+// ─────────────────────────────────────────────────────────────────────────────
+bool inRTH      = not na(time(timeframe.period, i_session, i_tz))
+bool sessionOK  = i_sesFilter ? inRTH : true
+bool is_rth_end = sessionOK[1] and not sessionOK
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INITIAL BALANCE
+// ─────────────────────────────────────────────────────────────────────────────
+int ny_hour = hour(time,   "America/New_York")
+int ny_min  = minute(time, "America/New_York")
+
+bool in_ib_session = (ny_hour == 9 and ny_min >= 30) or (ny_hour == 10 and ny_min <= 29)
+bool is_ib_start   = in_ib_session and not in_ib_session[1]
+bool is_ib_end     = not in_ib_session and in_ib_session[1]
+
+var float[] hi_arr    = array.new_float()
+var float[] lo_arr    = array.new_float()
+var int[]   start_arr = array.new_int()
+var int[]   end_arr   = array.new_int()
+
+var float sess_high     = na
+var float sess_low      = na
+var bool  sess_active   = false
+var float ib_high_today = na
+var float ib_low_today  = na
+var float ib_mid_today  = na
+var float ib_range      = na
+
+if is_ib_start
+    sess_high   := high
+    sess_low    := low
+    sess_active := true
+    array.push(start_arr, bar_index)
+
+if in_ib_session and sess_active
+    sess_high := math.max(sess_high, high)
+    sess_low  := math.min(sess_low,  low)
+
+if is_ib_end and sess_active
+    array.push(hi_arr,  sess_high)
+    array.push(lo_arr,  sess_low)
+    array.push(end_arr, bar_index)
+    ib_high_today := sess_high
+    ib_low_today  := sess_low
+    ib_mid_today  := (sess_high + sess_low) / 2
+    ib_range      := sess_high - sess_low
+    sess_active   := false
+
+if in_ib_session and sess_active
+    ib_high_today := sess_high
+    ib_low_today  := sess_low
+    ib_mid_today  := (sess_high + sess_low) / 2
+    ib_range      := sess_high - sess_low
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IB PROXIMITY
+// ─────────────────────────────────────────────────────────────────────────────
+nearIBLevel(float price, float ibLevel, float ibRng) =>
+    bool result = false
+    if not na(ibLevel) and not na(ibRng) and ibRng > 0.0
+        result := math.abs(price - ibLevel) <= ibRng * ib_proximity
+    result
+
+fvgNearIB(float fvgMid) =>
+    string ctx = ""
+    if not na(ib_range) and ib_range > 0.0
+        if nearIBLevel(fvgMid, ib_high_today, ib_range)
+            ctx := "IB High"
+        else if nearIBLevel(fvgMid, ib_low_today, ib_range)
+            ctx := "IB Low"
+        else if nearIBLevel(fvgMid, ib_mid_today, ib_range)
+            ctx := "IB Mid"
+    ctx
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BAR BUY / SELL SPLIT
+// ─────────────────────────────────────────────────────────────────────────────
+float barRng    = high - low
+float bodyRatio = barRng > 0.0 ? math.abs(close - open) / barRng : 0.5
+float buyVol    = close >= open ? volume * (0.5 + bodyRatio * 0.5) : volume * (0.5 - bodyRatio * 0.5)
+float sellVol   = volume - buyVol
+float delta     = buyVol - sellVol
+float cumDelta  = ta.cum(delta)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNAL 1 — ABSORPTION
+// ─────────────────────────────────────────────────────────────────────────────
+float avgVol        = ta.sma(volume, 20)
+float barRangeTicks = barRng / i_ticksize
+bool  highVol       = volume > avgVol * i_absorbMult
+bool  tightRange    = barRangeTicks <= float(i_absorbTicks)
+bool  absorbBull    = highVol and tightRange and close < open
+bool  absorbBear    = highVol and tightRange and close >= open
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNAL 2 — DELTA DIVERGENCE
+// ─────────────────────────────────────────────────────────────────────────────
+float priceChange = close - close[i_divLen]
+float deltaChange = cumDelta - cumDelta[i_divLen]
+bool  bullDiv     = priceChange < 0.0 and deltaChange > 0.0
+bool  bearDiv     = priceChange > 0.0 and deltaChange < 0.0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNAL 3 — DELTA MOMENTUM
+// ─────────────────────────────────────────────────────────────────────────────
+float deltaSma     = ta.sma(delta, i_momLen)
+bool  bullDeltaMom = deltaSma > 0.0
+bool  bearDeltaMom = deltaSma < 0.0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNAL 4 — STACKED IMBALANCE
+// ─────────────────────────────────────────────────────────────────────────────
+bool stackBuy  = true
+bool stackSell = true
+
+for si = 0 to i_stackN - 1
+    float h_s  = high[si]
+    float l_s  = low[si]
+    float c_s  = close[si]
+    float o_s  = open[si]
+    float v_s  = volume[si]
+    float br_s = (h_s - l_s) > 0.0 ? math.abs(c_s - o_s) / (h_s - l_s) : 0.5
+    float bv_s = c_s >= o_s ? v_s * (0.5 + br_s * 0.5) : v_s * (0.5 - br_s * 0.5)
+    float bp_s = v_s > 0.0 ? bv_s / v_s * 100.0 : 50.0
+    if not (bp_s >= i_imbPct and v_s >= i_imbMinVol)
+        stackBuy := false
+    if not ((100.0 - bp_s) >= i_imbPct and v_s >= i_imbMinVol)
+        stackSell := false
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNAL 5 — IB CONFLUENCE
+// ─────────────────────────────────────────────────────────────────────────────
+bool nearIBLow  = not na(ib_low_today)  and nearIBLevel(close, ib_low_today,  ib_range)
+bool nearIBHigh = not na(ib_high_today) and nearIBLevel(close, ib_high_today, ib_range)
+bool nearIBMid  = not na(ib_mid_today)  and nearIBLevel(close, ib_mid_today,  ib_range)
+bool ibConfBull = nearIBLow  or (nearIBMid and close < ib_mid_today)
+bool ibConfBear = nearIBHigh or (nearIBMid and close >= ib_mid_today)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFLUENCE SCORE
+// ─────────────────────────────────────────────────────────────────────────────
+int bullScore = (absorbBull ? 1 : 0) + (bullDiv ? 1 : 0) + (bullDeltaMom ? 1 : 0) + (stackBuy ? 1 : 0) + (ibConfBull ? 1 : 0)
+int bearScore = (absorbBear ? 1 : 0) + (bearDiv ? 1 : 0) + (bearDeltaMom ? 1 : 0) + (stackSell ? 1 : 0) + (ibConfBear ? 1 : 0)
+
+bool buySignal  = sessionOK and bullScore >= i_minScore
+bool sellSignal = sessionOK and bearScore >= i_minScore
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POC CALCULATION
+// ─────────────────────────────────────────────────────────────────────────────
+int   LEVELS   = i_levels
+float hiMax    = ta.highest(high, i_lookback)
+float loMin    = ta.lowest(low,   i_lookback)
+float priceRng = hiMax - loMin
+float bucketSz = priceRng > 0.0 ? priceRng / LEVELS : i_ticksize * LEVELS
+
+var float[] lvlBuyVol  = array.new_float(0)
+var float[] lvlSellVol = array.new_float(0)
+var float[] lvlPrice   = array.new_float(0)
+var line    pocLine    = na
+var float   pocPrice   = na
+
+if barstate.islast
+    array.clear(lvlBuyVol)
+    array.clear(lvlSellVol)
+    array.clear(lvlPrice)
+
+    for k = 0 to LEVELS - 1
+        array.push(lvlBuyVol,  0.0)
+        array.push(lvlSellVol, 0.0)
+        array.push(lvlPrice,   loMin + (k + 0.5) * bucketSz)
+
+    for j = 0 to i_lookback - 1
+        float h_j   = high[j]
+        float l_j   = low[j]
+        float c_j   = close[j]
+        float o_j   = open[j]
+        float v_j   = volume[j]
+        float mid_j = (h_j + l_j) / 2.0
+        float br_j  = (h_j - l_j) > 0.0 ? math.abs(c_j - o_j) / (h_j - l_j) : 0.5
+        float bv_j  = c_j >= o_j ? v_j * (0.5 + br_j * 0.5) : v_j * (0.5 - br_j * 0.5)
+        float sv_j  = v_j - bv_j
+        int   bIdx  = priceRng > 0.0 ? int(math.floor((mid_j - loMin) / bucketSz)) : 0
+        bIdx := math.min(math.max(bIdx, 0), LEVELS - 1)
+        array.set(lvlBuyVol,  bIdx, array.get(lvlBuyVol,  bIdx) + bv_j)
+        array.set(lvlSellVol, bIdx, array.get(lvlSellVol, bIdx) + sv_j)
+
+    int   pocIdx = 0
+    float maxVol = 0.0
+    for pi = 0 to LEVELS - 1
+        float tv = array.get(lvlBuyVol, pi) + array.get(lvlSellVol, pi)
+        if tv > maxVol
+            maxVol := tv
+            pocIdx := pi
+    pocPrice := array.get(lvlPrice, pocIdx)
+
+    if i_showPOC
+        if not na(pocLine)
+            line.delete(pocLine)
+        pocLine := line.new(bar_index - i_lookback, pocPrice, bar_index, pocPrice, color=color.new(i_colPOC, 50), width=1, style=line.style_dotted, extend=extend.right)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T2 CALCULATION
+// ─────────────────────────────────────────────────────────────────────────────
+calcT2Long(float entryPrice) =>
+    float t2    = na
+    float above = entryPrice + 10.0
+    if not na(ib_mid_today) and ib_mid_today > above
+        t2 := ib_mid_today
+    if not na(ib_high_today) and ib_high_today > above
+        if na(t2) or ib_high_today < t2
+            t2 := ib_high_today
+    if not na(pocPrice) and pocPrice > above
+        if na(t2) or pocPrice < t2
+            t2 := pocPrice
+    t2
+
+calcT2Short(float entryPrice) =>
+    float t2    = na
+    float below = entryPrice - 10.0
+    if not na(ib_mid_today) and ib_mid_today < below
+        t2 := ib_mid_today
+    if not na(ib_low_today) and ib_low_today < below
+        if na(t2) or ib_low_today > t2
+            t2 := ib_low_today
+    if not na(pocPrice) and pocPrice < below
+        if na(t2) or pocPrice > t2
+            t2 := pocPrice
+    t2
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FVG STATE ARRAYS
+// ─────────────────────────────────────────────────────────────────────────────
+var float[]  bull_top   = array.new_float()
+var float[]  bull_bot   = array.new_float()
+var int[]    bull_bar   = array.new_int()
+var string[] bull_ib    = array.new_string()
+var box[]    bull_boxes = array.new_box()
+
+var float[]  bear_top   = array.new_float()
+var float[]  bear_bot   = array.new_float()
+var int[]    bear_bar   = array.new_int()
+var string[] bear_ib    = array.new_string()
+var box[]    bear_boxes = array.new_box()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLEAR ALL FVGs
+// ─────────────────────────────────────────────────────────────────────────────
+clearAllFVGs() =>
+    if array.size(bull_boxes) > 0
+        for i = 0 to array.size(bull_boxes) - 1
+            box.delete(array.get(bull_boxes, i))
+    if array.size(bear_boxes) > 0
+        for i = 0 to array.size(bear_boxes) - 1
+            box.delete(array.get(bear_boxes, i))
+    array.clear(bull_top)
+    array.clear(bull_bot)
+    array.clear(bull_bar)
+    array.clear(bull_ib)
+    array.clear(bull_boxes)
+    array.clear(bear_top)
+    array.clear(bear_bot)
+    array.clear(bear_bar)
+    array.clear(bear_ib)
+    array.clear(bear_boxes)
+
+if is_rth_end
+    clearAllFVGs()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FVG DETECTION
+// ─────────────────────────────────────────────────────────────────────────────
+bool isBullFVG = sessionOK and (low > high[2])
+bool isBearFVG = sessionOK and (high < low[2])
+
+// track whether a new IB-proximate FVG was actually stored (used for alerts)
+var bool newBullFVGStored = false
+var bool newBearFVGStored = false
+newBullFVGStored := false
+newBearFVGStored := false
+
+if isBullFVG and array.size(bull_top) < i_maxFVGs
+    float ft     = low
+    float fb     = high[2]
+    float fvgMid = (ft + fb) / 2.0
+    string ibCtx = fvgNearIB(fvgMid)
+    if str.length(ibCtx) > 0
+        array.push(bull_top, ft)
+        array.push(bull_bot, fb)
+        array.push(bull_bar, bar_index)
+        array.push(bull_ib,  ibCtx)
+        newBullFVGStored := true
+        if i_showFVG
+            array.push(bull_boxes, box.new(bar_index - 2, ft, bar_index, fb, bgcolor=i_bullFVGCol, border_color=color.new(color.green, 40), border_width=1))
+        else
+            array.push(bull_boxes, box.new(bar_index, 0, bar_index, 0, bgcolor=color.new(color.green, 100), border_color=color.new(color.green, 100)))
+
+if isBearFVG and array.size(bear_top) < i_maxFVGs
+    float ft     = low[2]
+    float fb     = high
+    float fvgMid = (ft + fb) / 2.0
+    string ibCtx = fvgNearIB(fvgMid)
+    if str.length(ibCtx) > 0
+        array.push(bear_top, ft)
+        array.push(bear_bot, fb)
+        array.push(bear_bar, bar_index)
+        array.push(bear_ib,  ibCtx)
+        newBearFVGStored := true
+        if i_showFVG
+            array.push(bear_boxes, box.new(bar_index - 2, ft, bar_index, fb, bgcolor=i_bearFVGCol, border_color=color.new(color.red, 40), border_width=1))
+        else
+            array.push(bear_boxes, box.new(bar_index, 0, bar_index, 0, bgcolor=color.new(color.red, 100), border_color=color.new(color.red, 100)))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EXTEND BOXES + REMOVE INVALIDATED FVGs
+// ─────────────────────────────────────────────────────────────────────────────
+int bullSz = array.size(bull_top)
+if bullSz > 0
+    for i = bullSz - 1 to 0
+        if i_showFVG
+            box.set_right(array.get(bull_boxes, i), bar_index)
+        if close < array.get(bull_bot, i)
+            if i_showFVG
+                box.delete(array.get(bull_boxes, i))
+            array.remove(bull_top,   i)
+            array.remove(bull_bot,   i)
+            array.remove(bull_bar,   i)
+            array.remove(bull_ib,    i)
+            array.remove(bull_boxes, i)
+
+int bearSz = array.size(bear_top)
+if bearSz > 0
+    for i = bearSz - 1 to 0
+        if i_showFVG
+            box.set_right(array.get(bear_boxes, i), bar_index)
+        if close > array.get(bear_top, i)
+            if i_showFVG
+                box.delete(array.get(bear_boxes, i))
+            array.remove(bear_top,   i)
+            array.remove(bear_bot,   i)
+            array.remove(bear_bar,   i)
+            array.remove(bear_ib,    i)
+            array.remove(bear_boxes, i)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENTRY LOGIC
+// Match by bar_index value, not array position, to survive prior removals
+// ─────────────────────────────────────────────────────────────────────────────
+bool   longEntry   = false
+bool   shortEntry  = false
+float  entryFVGTop = na
+float  entryFVGBot = na
+string entryIBCtx  = ""
+int    entryIdx    = -1
+int    entryBarRef = -1
+
+if buySignal and array.size(bull_top) > 0
+    for i = 0 to array.size(bull_top) - 1
+        float ft = array.get(bull_top, i)
+        float fb = array.get(bull_bot, i)
+        if close >= fb and close <= ft
+            longEntry   := true
+            entryFVGTop := ft
+            entryFVGBot := fb
+            entryIBCtx  := array.get(bull_ib,  i)
+            entryBarRef := array.get(bull_bar,  i)
+            entryIdx    := i
+            break
+
+if sellSignal and array.size(bear_top) > 0
+    for i = 0 to array.size(bear_top) - 1
+        float ft = array.get(bear_top, i)
+        float fb = array.get(bear_bot, i)
+        if close >= fb and close <= ft
+            shortEntry  := true
+            entryFVGTop := ft
+            entryFVGBot := fb
+            entryIBCtx  := array.get(bear_ib,  i)
+            entryBarRef := array.get(bear_bar,  i)
+            entryIdx    := i
+            break
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STOP LOSS + SKIP IF TOO WIDE
+// ─────────────────────────────────────────────────────────────────────────────
+float longStop  = na
+float shortStop = na
+
+if longEntry
+    float ibLevel = na
+    if entryIBCtx == "IB Low"  and not na(ib_low_today)
+        ibLevel := ib_low_today
+    else if entryIBCtx == "IB Mid" and not na(ib_mid_today)
+        ibLevel := ib_mid_today
+    else if entryIBCtx == "IB High" and not na(ib_high_today)
+        ibLevel := ib_high_today
+    float stopBase = entryFVGBot
+    if not na(ibLevel) and ibLevel < stopBase
+        stopBase := ibLevel
+    longStop := stopBase - (i_ticksize * 2)
+    if (close - longStop) > i_maxStop
+        longEntry := false
+
+if shortEntry
+    float ibLevel = na
+    if entryIBCtx == "IB High" and not na(ib_high_today)
+        ibLevel := ib_high_today
+    else if entryIBCtx == "IB Mid" and not na(ib_mid_today)
+        ibLevel := ib_mid_today
+    else if entryIBCtx == "IB Low" and not na(ib_low_today)
+        ibLevel := ib_low_today
+    float stopBase = entryFVGTop
+    if not na(ibLevel) and ibLevel > stopBase
+        stopBase := ibLevel
+    shortStop := stopBase + (i_ticksize * 2)
+    if (shortStop - close) > i_maxStop
+        shortEntry := false
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REMOVE TRIGGERED FVG — search by bar reference to avoid stale index
+// ─────────────────────────────────────────────────────────────────────────────
+if longEntry and entryBarRef >= 0
+    int sz = array.size(bull_bar)
+    for i = sz - 1 to 0
+        if array.get(bull_bar, i) == entryBarRef
+            if i_showFVG
+                box.delete(array.get(bull_boxes, i))
+            array.remove(bull_top,   i)
+            array.remove(bull_bot,   i)
+            array.remove(bull_bar,   i)
+            array.remove(bull_ib,    i)
+            array.remove(bull_boxes, i)
+            break
+
+if shortEntry and entryBarRef >= 0
+    int sz = array.size(bear_bar)
+    for i = sz - 1 to 0
+        if array.get(bear_bar, i) == entryBarRef
+            if i_showFVG
+                box.delete(array.get(bear_boxes, i))
+            array.remove(bear_top,   i)
+            array.remove(bear_bot,   i)
+            array.remove(bear_bar,   i)
+            array.remove(bear_ib,    i)
+            array.remove(bear_boxes, i)
+            break
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BAR BACKGROUND
+// ─────────────────────────────────────────────────────────────────────────────
+color bgCol = na
+if longEntry
+    bgCol := color.new(#00C853, 85)
+else if shortEntry
+    bgCol := color.new(#D50000, 85)
+bgcolor(bgCol, title="Entry Bar Highlight")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENTRY LABELS
+// ─────────────────────────────────────────────────────────────────────────────
+if i_showSigs
+    if longEntry
+        float  t1    = close + 10.0
+        float  t2    = calcT2Long(close)
+        string t2txt = na(t2) ? "Next IB/POC above T1" : fmtP(t2)
+        string txt   = "▲ LONG FVG  " + scoreLabel(bullScore)
+        txt := txt + "\nIB Level : " + entryIBCtx
+        txt := txt + "\nScore    : " + str.tostring(bullScore) + " / 5"
+        txt := txt + "\nFVG Zone : " + fmtP(entryFVGBot) + " - " + fmtP(entryFVGTop)
+        txt := txt + "\nEntry    : " + fmtP(close) + " (next bar open)"
+        txt := txt + "\nStop     : " + fmtP(longStop)
+        txt := txt + "\nT1       : " + fmtP(t1) + "  (+10 pts)"
+        txt := txt + "\nT2       : " + t2txt
+        label.new(bar_index, low - i_ticksize * 10, txt, style=label.style_label_up, color=color.new(#00C853, 10), textcolor=color.white, size=size.normal)
+
+    if shortEntry
+        float  t1    = close - 10.0
+        float  t2    = calcT2Short(close)
+        string t2txt = na(t2) ? "Next IB/POC below T1" : fmtP(t2)
+        string txt   = "▼ SHORT FVG  " + scoreLabel(bearScore)
+        txt := txt + "\nIB Level : " + entryIBCtx
+        txt := txt + "\nScore    : " + str.tostring(bearScore) + " / 5"
+        txt := txt + "\nFVG Zone : " + fmtP(entryFVGBot) + " - " + fmtP(entryFVGTop)
+        txt := txt + "\nEntry    : " + fmtP(close) + " (next bar open)"
+        txt := txt + "\nStop     : " + fmtP(shortStop)
+        txt := txt + "\nT1       : " + fmtP(t1) + "  (-10 pts)"
+        txt := txt + "\nT2       : " + t2txt
+        label.new(bar_index, high + i_ticksize * 10, txt, style=label.style_label_down, color=color.new(#D50000, 10), textcolor=color.white, size=size.normal)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IB LINES + LABELS DRAWING
+// Labels anchored at session START (x1, left side) — style_label_right so
+// text flows rightward from the anchor, keeping labels away from price action
+// ─────────────────────────────────────────────────────────────────────────────
+var line[]  h_lines  = array.new_line()
+var line[]  l_lines  = array.new_line()
+var line[]  m_lines  = array.new_line()
+var label[] h_labels = array.new_label()
+var label[] l_labels = array.new_label()
+var label[] m_labels = array.new_label()
+
+var line  live_h  = na
+var line  live_l  = na
+var line  live_m  = na
+var label live_hl = na
+var label live_ll = na
+var label live_ml = na
+
+clearDrawings() =>
+    if array.size(h_lines) > 0
+        for i = 0 to array.size(h_lines) - 1
+            line.delete(array.get(h_lines, i))
+    if array.size(l_lines) > 0
+        for i = 0 to array.size(l_lines) - 1
+            line.delete(array.get(l_lines, i))
+    if array.size(m_lines) > 0
+        for i = 0 to array.size(m_lines) - 1
+            line.delete(array.get(m_lines, i))
+    if array.size(h_labels) > 0
+        for i = 0 to array.size(h_labels) - 1
+            label.delete(array.get(h_labels, i))
+    if array.size(l_labels) > 0
+        for i = 0 to array.size(l_labels) - 1
+            label.delete(array.get(l_labels, i))
+    if array.size(m_labels) > 0
+        for i = 0 to array.size(m_labels) - 1
+            label.delete(array.get(m_labels, i))
+    array.clear(h_lines)
+    array.clear(l_lines)
+    array.clear(m_lines)
+    array.clear(h_labels)
+    array.clear(l_labels)
+    array.clear(m_labels)
+
+if is_ib_end
+    line.delete(live_h)
+    line.delete(live_l)
+    line.delete(live_m)
+    label.delete(live_hl)
+    label.delete(live_ll)
+    label.delete(live_ml)
+    live_h  := na
+    live_l  := na
+    live_m  := na
+    live_hl := na
+    live_ll := na
+    live_ml := na
+    clearDrawings()
+
+    int   total    = array.size(hi_arr)
+    int   from_idx = math.max(0, total - show_days)
+    ext_mode      = extend_lines ? extend.right : extend.none
+
+    for i = from_idx to total - 1
+        float h  = array.get(hi_arr,    i)
+        float l  = array.get(lo_arr,    i)
+        float m  = (h + l) / 2
+        int   x1 = array.get(start_arr, i)
+        int   x2 = array.get(end_arr,   i)
+        string day_tag = i == total - 1 ? "Today" : "D-" + str.tostring(total - 1 - i)
+
+        array.push(h_lines, line.new(x1, h, x2, h, color=color.new(hi_color,  50), width=line_width, extend=ext_mode))
+        array.push(l_lines, line.new(x1, l, x2, l, color=color.new(lo_color,  50), width=line_width, extend=ext_mode))
+        array.push(m_lines, line.new(x1, m, x2, m, color=color.new(mid_color, 50), width=line_width, extend=ext_mode, style=line.style_dashed))
+
+        // Labels anchored at x1 (session start), text flows right
+        if show_labels
+            array.push(h_labels, label.new(x1, h, day_tag + " IB High\n" + str.tostring(h, "#.##"), color=color.new(hi_color,  50), textcolor=color.white, style=label.style_label_right, size=size.small))
+            array.push(l_labels, label.new(x1, l, day_tag + " IB Low\n"  + str.tostring(l, "#.##"), color=color.new(lo_color,  50), textcolor=color.white, style=label.style_label_right, size=size.small))
+            array.push(m_labels, label.new(x1, m, day_tag + " IB Mid\n"  + str.tostring(m, "#.##"), color=color.new(mid_color, 50), textcolor=color.white, style=label.style_label_right, size=size.small))
+
+// Live IB labels also anchored at session start — only text/price updated each bar
+if in_ib_session and sess_active
+    float m  = (sess_high + sess_low) / 2
+    int   x1 = array.get(start_arr, array.size(start_arr) - 1)
+    ext_mode = extend_lines ? extend.right : extend.none
+
+    if na(live_h)
+        live_h  := line.new(x1, sess_high, bar_index, sess_high, color=color.new(hi_color,  50), width=line_width, extend=ext_mode)
+        live_l  := line.new(x1, sess_low,  bar_index, sess_low,  color=color.new(lo_color,  50), width=line_width, extend=ext_mode)
+        live_m  := line.new(x1, m,         bar_index, m,         color=color.new(mid_color, 50), width=line_width, extend=ext_mode, style=line.style_dashed)
+        if show_labels
+            // Anchored at x1; position never moves, only text updates as IB expands
+            live_hl := label.new(x1, sess_high, "Live IB High\n" + str.tostring(sess_high, "#.##"), color=color.new(hi_color,  50), textcolor=color.white, style=label.style_label_right, size=size.small)
+            live_ll := label.new(x1, sess_low,  "Live IB Low\n"  + str.tostring(sess_low,  "#.##"), color=color.new(lo_color,  50), textcolor=color.white, style=label.style_label_right, size=size.small)
+            live_ml := label.new(x1, m,         "Live IB Mid\n"  + str.tostring(m,          "#.##"), color=color.new(mid_color, 50), textcolor=color.white, style=label.style_label_right, size=size.small)
+    else
+        line.set_y1(live_h, sess_high)
+        line.set_y2(live_h, sess_high)
+        line.set_y1(live_l, sess_low)
+        line.set_y2(live_l, sess_low)
+        line.set_y1(live_m, m)
+        line.set_y2(live_m, m)
+        line.set_x2(live_h, bar_index)
+        line.set_x2(live_l, bar_index)
+        line.set_x2(live_m, bar_index)
+        // Update price text only — x position stays at session start
+        if show_labels and not na(live_hl)
+            label.set_y(live_hl, sess_high)
+            label.set_y(live_ll, sess_low)
+            label.set_y(live_ml, m)
+            label.set_text(live_hl, "Live IB High\n" + str.tostring(sess_high, "#.##"))
+            label.set_text(live_ll, "Live IB Low\n"  + str.tostring(sess_low,  "#.##"))
+            label.set_text(live_ml, "Live IB Mid\n"  + str.tostring(m,         "#.##"))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+alertcondition(newBullFVGStored, title="IBL+FVG: Bull FVG Setup", message="Bullish FVG near IB level on {{ticker}} — watch for pullback")
+alertcondition(newBearFVGStored, title="IBL+FVG: Bear FVG Setup", message="Bearish FVG near IB level on {{ticker}} — watch for pullback")
+alertcondition(longEntry,  title="IBL+FVG: LONG Entry",     message="LONG entry — FVG + IB + SuperDOM on {{ticker}} at {{close}}")
+alertcondition(shortEntry, title="IBL+FVG: SHORT Entry",    message="SHORT entry — FVG + IB + SuperDOM on {{ticker}} at {{close}}")
+alertcondition(longEntry  and bullScore == 5, title="IBL+FVG: MAX LONG 5/5",  message="MAX CONFIDENCE LONG on {{ticker}} at {{close}}")
+alertcondition(shortEntry and bearScore == 5, title="IBL+FVG: MAX SHORT 5/5", message="MAX CONFIDENCE SHORT on {{ticker}} at {{close}}")
+alertcondition(ta.crossover(cumDelta,  0.0), title="IBL+FVG: Delta Positive", message="Cumulative Delta crossed ABOVE zero on {{ticker}}")
+alertcondition(ta.crossunder(cumDelta, 0.0), title="IBL+FVG: Delta Negative", message="Cumulative Delta crossed BELOW zero on {{ticker}}")
+
+// =============================================================================
+// END
+// =============================================================================
