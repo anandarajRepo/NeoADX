@@ -1,0 +1,228 @@
+// ============================================================================
+// NQ Mini Futures — Liquidity Grab + FVG Retest Strategy  v3
+// ----------------------------------------------------------------------------
+// Chart     : NQ1! or MNQ1!  |  Timeframe: 1 min
+//
+// v3 improvements over the separate 4H / 1H / 15M scripts:
+//   1. Single script — choose grab TF (15M / 1H / 4H) in the Settings panel
+//   2. 4H EMA trend gate — longs only above 4H EMA, shorts only below
+//   3. FVG expiry — stale unretested FVGs auto-invalidate (default 30 bars)
+//   4. Retest close confirmation — close must hold ≥ FVG midpoint (long)
+//                                                    ≤ FVG midpoint (short)
+//   5. RTH session filter (toggleable, default ON)
+//   6. Min FVG size — skip micro-FVGs < 2 pts
+//   7. Volume threshold raised to 1.5× avg (was 1×)
+//   8. be_pts default raised 5 → 10 pts (gives trades room before trail fires)
+// ============================================================================
+
+//@version=5
+strategy("NQ — Liq Grab + FVG Strategy v3",
+     overlay           = true,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     commission_type   = strategy.commission.cash_per_contract,
+     commission_value  = 2.0,
+     slippage          = 1)
+
+// ── Timeframe ─────────────────────────────────────────────────────────────────
+tf_choice = input.string("15M", "Grab Reference Timeframe",
+     options=["15M", "1H", "4H"], group="Timeframe",
+     tooltip="Timeframe used to detect the liquidity grab (stop sweep).\n15M = ~3-5 signals/day.\n1H  = ~1-2 signals/day.\n4H  = ~1-2 signals/week.")
+grab_tf = tf_choice == "4H" ? "240" : tf_choice == "1H" ? "60" : "15"
+
+// ── Filters ───────────────────────────────────────────────────────────────────
+grab_lookback = input.int(5,    "Grab Look-back (bars)", minval=2, maxval=20, group="Filters",
+     tooltip="N bars before the last completed HTF bar that define the swing high/low being swept. Higher = more trades.")
+vol_period    = input.int(20,   "Volume MA Period",       minval=5,            group="Filters")
+vol_mult      = input.float(1.5,"Volume Multiplier (×avg)", minval=1.0, step=0.1, group="Filters",
+     tooltip="The middle candle of the FVG must have volume ≥ this multiple of the N-bar average.")
+min_fvg       = input.float(2,  "Min FVG Width (pts)",    minval=0.25, step=0.25, group="Filters",
+     tooltip="Skip FVGs narrower than this — micro-FVGs get retested and reversed too easily.")
+max_fvg       = input.float(10, "Max FVG Width (pts)",    minval=0.25, step=0.25, group="Filters",
+     tooltip="Skip FVGs wider than this — limits the maximum natural SL size.")
+fvg_expiry    = input.int(30,   "FVG Expiry (bars)",      minval=5, maxval=200,  group="Filters",
+     tooltip="Auto-invalidate an unretested FVG after this many 1-min bars (default 30 = 30 min).")
+use_ema       = input.bool(true, "4H EMA Trend Filter",   group="Filters",
+     tooltip="When ON: only long when 4H price > 4H EMA; only short when 4H price < 4H EMA.")
+ema_period    = input.int(50,   "EMA Period (4H)",        minval=10,             group="Filters")
+use_confirm   = input.bool(true, "Retest Close Confirmation", group="Filters",
+     tooltip="When ON: retest candle must close at/above FVG midpoint (long) or at/below midpoint (short). Filters fake retests.")
+
+// ── Session ───────────────────────────────────────────────────────────────────
+use_session = input.bool(true,  "RTH Session Filter",      group="Session",
+     tooltip="When ON: only accept FVG signals during the session window below.")
+sess_start  = input.int(930,    "Session Start (HHMM ET)", group="Session")
+sess_end    = input.int(1530,   "Session End   (HHMM ET)", group="Session")
+
+// ── Exits ─────────────────────────────────────────────────────────────────────
+sl_buf = input.float(2,  "SL Buffer Beyond FVG (pts)", minval=0.25, step=0.25, group="Exits",
+     tooltip="Extra buffer added beyond the FVG edge for the initial stop loss.")
+be_pts = input.float(10, "Breakeven Trail Activation (pts)", minval=0.25, step=0.25, group="Exits",
+     tooltip="Once profit reaches this many points: stop moves to breakeven, then trails be_pts behind the running extreme.")
+
+// ── HTF Liquidity Grab ────────────────────────────────────────────────────────
+[htf_h, htf_l, htf_c] = request.security(syminfo.tickerid, grab_tf,
+     [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+
+htf_swing_high = request.security(syminfo.tickerid, grab_tf,
+     ta.highest(high, grab_lookback)[2], lookahead=barmerge.lookahead_on)
+
+htf_swing_low  = request.security(syminfo.tickerid, grab_tf,
+     ta.lowest(low,  grab_lookback)[2], lookahead=barmerge.lookahead_on)
+
+// Bullish grab: last HTF bar wicked BELOW N-bar swing low → closed back ABOVE it
+bull_grab = htf_l < htf_swing_low  and htf_c > htf_swing_low
+// Bearish grab: last HTF bar wicked ABOVE N-bar swing high → closed back BELOW it
+bear_grab = htf_h > htf_swing_high and htf_c < htf_swing_high
+
+// ── 4H EMA (always 4H — macro trend anchor) ───────────────────────────────────
+h4_ema   = request.security(syminfo.tickerid, "240",
+     ta.ema(close, ema_period), lookahead=barmerge.lookahead_on)
+h4_close = request.security(syminfo.tickerid, "240",
+     close[1], lookahead=barmerge.lookahead_on)
+
+trend_up = not use_ema or h4_close > h4_ema
+trend_dn = not use_ema or h4_close < h4_ema
+
+// ── Indicators ───────────────────────────────────────────────────────────────
+vwap_val = ta.vwap(hlc3)
+avg_vol  = ta.sma(volume, vol_period)
+
+// ── Session gate ──────────────────────────────────────────────────────────────
+bar_hm     = hour * 100 + minute
+in_session = not use_session or (bar_hm >= sess_start and bar_hm < sess_end)
+
+// ── 1-min FVG Detection ───────────────────────────────────────────────────────
+// Bullish FVG: gap between bar[2] high and current low — impulse bar is bar[1]
+bull_fvg_now  = low > high[2]
+bull_fvg_top  = low
+bull_fvg_bot  = high[2]
+bull_fvg_mid  = math.avg(bull_fvg_top, bull_fvg_bot)
+bull_fvg_size = bull_fvg_top - bull_fvg_bot
+
+// Bearish FVG: gap between bar[2] low and current high — impulse bar is bar[1]
+bear_fvg_now  = high < low[2]
+bear_fvg_top  = low[2]
+bear_fvg_bot  = high
+bear_fvg_mid  = math.avg(bear_fvg_top, bear_fvg_bot)
+bear_fvg_size = bear_fvg_top - bear_fvg_bot
+
+// ── Validate FVG ─────────────────────────────────────────────────────────────
+bull_valid = bull_fvg_now
+     and bull_grab
+     and bull_fvg_size >= min_fvg
+     and bull_fvg_size <= max_fvg
+     and volume[1]     >= avg_vol * vol_mult
+     and bull_fvg_bot  >= vwap_val
+     and trend_up
+     and in_session
+
+bear_valid = bear_fvg_now
+     and bear_grab
+     and bear_fvg_size >= min_fvg
+     and bear_fvg_size <= max_fvg
+     and volume[1]     >= avg_vol * vol_mult
+     and bear_fvg_top  <= vwap_val
+     and trend_dn
+     and in_session
+
+// ── Store most recent valid FVG ───────────────────────────────────────────────
+var float b_top = na
+var float b_bot = na
+var float b_mid = na
+var bool  b_on  = false
+var int   b_bar = na
+
+var float s_top = na
+var float s_bot = na
+var float s_mid = na
+var bool  s_on  = false
+var int   s_bar = na
+
+no_pos = strategy.position_size == 0
+
+if bull_valid and no_pos
+    b_top := bull_fvg_top
+    b_bot := bull_fvg_bot
+    b_mid := bull_fvg_mid
+    b_on  := true
+    b_bar := bar_index
+
+if bear_valid and no_pos
+    s_top := bear_fvg_top
+    s_bot := bear_fvg_bot
+    s_mid := bear_fvg_mid
+    s_on  := true
+    s_bar := bar_index
+
+// Invalidate: price closes through the FVG (fully mitigated)
+if b_on and close < b_bot
+    b_on := false
+if s_on and close > s_top
+    s_on := false
+
+// Invalidate: FVG not retested within the expiry window
+if b_on and (bar_index - b_bar) > fvg_expiry
+    b_on := false
+if s_on and (bar_index - s_bar) > fvg_expiry
+    s_on := false
+
+// ── Entry: retest of FVG zone ─────────────────────────────────────────────────
+// Price must touch INTO the FVG and close inside it
+long_touch  = b_on and no_pos and bar_index > b_bar and low  <= b_top and close >= b_bot
+short_touch = s_on and no_pos and bar_index > s_bar and high >= s_bot and close <= s_top
+
+// Optional: close must hold at/above midpoint (long) or at/below midpoint (short)
+long_ok  = not use_confirm or close >= b_mid
+short_ok = not use_confirm or close <= s_mid
+
+long_entry  = long_touch  and long_ok
+short_entry = short_touch and short_ok
+
+var float long_sl  = na
+var float short_sl = na
+
+if long_entry
+    long_sl  := b_bot - sl_buf
+    b_on     := false
+    strategy.entry("Long", strategy.long)
+
+if short_entry
+    short_sl  := s_top + sl_buf
+    s_on      := false
+    strategy.entry("Short", strategy.short)
+
+// ── Exit: FVG initial SL + breakeven trail ────────────────────────────────────
+// Trail activates at +be_pts profit → stop locks to breakeven,
+// then trails be_pts behind the running high (long) / low (short)
+be_ticks = math.round(be_pts / syminfo.mintick)
+
+strategy.exit("XL", "Long",  stop=long_sl,  trail_points=be_ticks, trail_offset=be_ticks)
+strategy.exit("XS", "Short", stop=short_sl, trail_points=be_ticks, trail_offset=be_ticks)
+
+// ── Visuals ──────────────────────────────────────────────────────────────────
+plot(htf_swing_high, "HTF Swing High", color=color.new(color.red,    40), linewidth=1, style=plot.style_stepline)
+plot(htf_swing_low,  "HTF Swing Low",  color=color.new(color.green,  40), linewidth=1, style=plot.style_stepline)
+plot(h4_ema,         "4H EMA",         color=color.new(color.orange, 30), linewidth=1, style=plot.style_stepline)
+plot(vwap_val,       "VWAP",           color=color.blue, linewidth=2)
+
+bgcolor(bull_grab ? color.new(color.green, 93) : na, title="Bullish Grab Window")
+bgcolor(bear_grab ? color.new(color.red,   93) : na, title="Bearish Grab Window")
+
+if bull_valid
+    box.new(bar_index[2], bull_fvg_top, bar_index + 30, bull_fvg_bot,
+         border_color=color.new(color.green, 20),
+         bgcolor=color.new(color.green, 80), border_width=1)
+
+if bear_valid
+    box.new(bar_index[2], bear_fvg_top, bar_index + 30, bear_fvg_bot,
+         border_color=color.new(color.red, 20),
+         bgcolor=color.new(color.red, 80), border_width=1)
+
+plotshape(long_entry,
+     style=shape.triangleup, location=location.belowbar,
+     color=color.lime, size=size.normal, title="Long Entry")
+
+plotshape(short_entry,
+     style=shape.triangledown, location=location.abovebar,
+     color=color.red, size=size.normal, title="Short Entry")
