@@ -40,11 +40,11 @@ min_fvg       = input.float(2,  "Min FVG Width (pts)",    minval=0.25, step=0.25
      tooltip="Skip FVGs narrower than this — micro-FVGs get retested and reversed too easily.")
 max_fvg       = input.float(10, "Max FVG Width (pts)",    minval=0.25, step=0.25, group="Filters",
      tooltip="Skip FVGs wider than this — limits the maximum natural SL size.")
-fvg_expiry    = input.int(30,   "FVG Expiry (bars)",      minval=5, maxval=200,  group="Filters",
-     tooltip="Auto-invalidate an unretested FVG after this many 1-min bars (default 30 = 30 min).")
-use_ema       = input.bool(true, "4H EMA Trend Filter",   group="Filters",
-     tooltip="When ON: only long when 4H price > 4H EMA; only short when 4H price < 4H EMA.")
-ema_period    = input.int(50,   "EMA Period (4H)",        minval=10,             group="Filters")
+fvg_expiry    = input.int(60,   "FVG Expiry (bars)",      minval=5, maxval=200,  group="Filters",
+     tooltip="Auto-invalidate an unretested FVG after this many 1-min bars (default 60 = 1 hour).")
+use_ema       = input.bool(true, "HTF EMA Trend Filter",  group="Filters",
+     tooltip="When ON: only long when HTF price > HTF EMA; only short when HTF price < HTF EMA. Uses the same TF as the grab (15M/1H/4H).")
+ema_period    = input.int(50,   "EMA Period",             minval=10,             group="Filters")
 use_confirm   = input.bool(true, "Retest Close Confirmation", group="Filters",
      tooltip="When ON: retest candle must close at/above FVG midpoint (long) or at/below midpoint (short). Filters fake retests.")
 
@@ -75,14 +75,17 @@ bull_grab = htf_l < htf_swing_low  and htf_c > htf_swing_low
 // Bearish grab: last HTF bar wicked ABOVE N-bar swing high → closed back BELOW it
 bear_grab = htf_h > htf_swing_high and htf_c < htf_swing_high
 
-// ── 4H EMA (always 4H — macro trend anchor) ───────────────────────────────────
-h4_ema   = request.security(syminfo.tickerid, "240",
+// ── HTF EMA — uses the same TF as the grab (15M/1H/4H) ───────────────────────
+// 1H grab uses 1H EMA, 4H grab uses 4H EMA — keeps trend filter self-consistent.
+// A 1H bullish grab often occurs while price is still below the 4H EMA (that IS
+// the stop sweep); locking to 4H EMA would block the very setup we're hunting.
+htf_ema       = request.security(syminfo.tickerid, grab_tf,
      ta.ema(close, ema_period), lookahead=barmerge.lookahead_on)
-h4_close = request.security(syminfo.tickerid, "240",
+htf_ema_close = request.security(syminfo.tickerid, grab_tf,
      close[1], lookahead=barmerge.lookahead_on)
 
-trend_up = not use_ema or h4_close > h4_ema
-trend_dn = not use_ema or h4_close < h4_ema
+trend_up = not use_ema or htf_ema_close > htf_ema
+trend_dn = not use_ema or htf_ema_close < htf_ema
 
 // ── Indicators ───────────────────────────────────────────────────────────────
 vwap_val = ta.vwap(hlc3)
@@ -203,7 +206,7 @@ strategy.exit("XS", "Short", stop=short_sl, trail_points=be_ticks, trail_offset=
 // ── Visuals ──────────────────────────────────────────────────────────────────
 plot(htf_swing_high, "HTF Swing High", color=color.new(color.red,    40), linewidth=1, style=plot.style_stepline)
 plot(htf_swing_low,  "HTF Swing Low",  color=color.new(color.green,  40), linewidth=1, style=plot.style_stepline)
-plot(h4_ema,         "4H EMA",         color=color.new(color.orange, 30), linewidth=1, style=plot.style_stepline)
+plot(htf_ema,        "HTF EMA",        color=color.new(color.orange, 30), linewidth=1, style=plot.style_stepline)
 plot(vwap_val,       "VWAP",           color=color.blue, linewidth=2)
 
 bgcolor(bull_grab ? color.new(color.green, 93) : na, title="Bullish Grab Window")
